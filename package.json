@@ -1,0 +1,13 @@
+{
+  "name": "apex-cicd-pipeline",
+  "version": "1.0.0",
+  "description": "Oracle APEX CI/CD pipeline with Jenkins, SQLcl, OCI GenAI and Playwright",
+  "scripts": {
+    "test:dev": "npx playwright test tests/generated/generated_apex_test.spec.ts --grep @smoke",
+    "test:full": "npx playwright test tests/generated/generated_apex_test.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "typescript": "^5.0.0"
+  }
+}
