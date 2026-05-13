@@ -320,7 +320,7 @@ python scripts/generate_playwright_tests.py
                     npm install
 
                     echo "Installing Playwright Chromium browser..."
-                    npx playwright install --with-deps chromium
+                    npx playwright install chromium
 
                     echo "Playwright dependencies installed."
                 '''
