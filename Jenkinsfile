@@ -135,7 +135,7 @@ pipeline {
                         echo "Using TNS_ADMIN=$TNS_ADMIN"
                         echo "Deploying SQL file: ${APEX_SQL_FILE}"
 
-                        sql -L -S "${DB_USER}/${DB_PASSWORD}@${DB_CONNECT}" <<EOF
+                        sql -L -S "${DB_USER}/\"${DB_PASSWORD}\"@${DB_CONNECT}" <<EOF
 whenever sqlerror exit sql.sqlcode
 set define off
 set sqlblanklines on
