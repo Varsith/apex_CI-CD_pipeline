@@ -132,10 +132,11 @@ pipeline {
 
                         export TNS_ADMIN="$PWD/wallet"
 
-                        echo "Using TNS_ADMIN=$TNS_ADMIN"
-                        echo "Deploying SQL file: ${APEX_SQL_FILE}"
+echo "Using TNS_ADMIN=$TNS_ADMIN"
+echo "Deploying SQL file: ${APEX_SQL_FILE}"
 
-                        sql -L -S "${DB_USER}/\"${DB_PASSWORD}\"@${DB_CONNECT}" <<EOF
+sql -L -S /nolog <<EOF
+connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
 set sqlblanklines on
@@ -143,6 +144,8 @@ set serveroutput on
 @${APEX_SQL_FILE}
 exit
 EOF
+
+echo "DEV deployment completed successfully."
 
                         echo "DEV deployment completed successfully."
                     '''
