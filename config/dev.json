@@ -1,0 +1,8 @@
+{
+  "environment": "dev",
+  "application_id": "100",
+  "application_name": "Sample APEX Application",
+  "application_url": "https://vndepyvklyhzyrr-qr3sbzfylnrinxn1.adb.us-ashburn-1.oraclecloudapps.com/ords/r/chaithra_interns/page-view",
+  "login_required": true,
+  "post_login_success_text": "Home"
+}
