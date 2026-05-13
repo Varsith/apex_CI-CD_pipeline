@@ -237,20 +237,30 @@ EOF
             }
         }
 
-        stage('Install Python Dependencies') {
-            when {
-                branch 'dev'
-            }
-            steps {
-                sh '''
-                    echo "Installing Python dependencies..."
+stage('Install Python Dependencies') {
+    when {
+        branch 'dev'
+    }
+    steps {
+        sh '''
+            echo "Creating Python virtual environment..."
 
-                    python3 -m pip install --user -r requirements.txt
+            rm -rf .venv
+            python3 -m venv .venv
 
-                    echo "Python dependencies installed."
-                '''
-            }
-        }
+            echo "Activating virtual environment..."
+            . .venv/bin/activate
+
+            echo "Upgrading pip..."
+            python -m pip install --upgrade pip
+
+            echo "Installing Python dependencies..."
+            python -m pip install -r requirements.txt
+
+            echo "Python dependencies installed inside virtual environment."
+        '''
+    }
+}
 
         stage('Generate Playwright Tests using OCI GenAI') {
             when {
@@ -285,7 +295,8 @@ EOF
                         export OCI_CHAT_MODEL_ID="$OCI_CHAT_MODEL_ID"
 
                         echo "Generating Playwright tests..."
-                        python3 scripts/generate_playwright_tests.py
+                        . .venv/bin/activate
+python scripts/generate_playwright_tests.py
 
                         if [ ! -f "${GENERATED_TEST_FILE}" ]; then
                             echo "ERROR: Playwright test was not generated."
