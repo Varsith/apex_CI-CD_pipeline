@@ -187,8 +187,14 @@ set define off
 set sqlblanklines on
 set serveroutput on
 
+declare
+    l_workspace_id number;
 begin
-    apex_application_install.set_workspace('${APEX_WORKSPACE}');
+    l_workspace_id := apex_util.find_security_group_id(
+        p_workspace => upper('${APEX_WORKSPACE}')
+    );
+
+    apex_application_install.set_workspace_id(l_workspace_id);
     apex_application_install.set_schema('${APEX_SCHEMA}');
     apex_application_install.set_application_id(100);
 end;
@@ -238,8 +244,14 @@ set define off
 set sqlblanklines on
 set serveroutput on
 
+declare
+    l_workspace_id number;
 begin
-    apex_application_install.set_workspace('${APEX_WORKSPACE}');
+    l_workspace_id := apex_util.find_security_group_id(
+        p_workspace => upper('${APEX_WORKSPACE}')
+    );
+
+    apex_application_install.set_workspace_id(l_workspace_id);
     apex_application_install.set_schema('${APEX_SCHEMA}');
     apex_application_install.set_application_id(100);
 end;
