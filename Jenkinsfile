@@ -154,33 +154,48 @@ echo "DEV deployment completed successfully."
         }
 
         stage('Deploy to STAGE') {
-            when {
-                branch 'stage'
-            }
-            steps {
-                withCredentials([
-                    string(credentialsId: 'STAGE_DB_USER', variable: 'DB_USER'),
-                    string(credentialsId: 'STAGE_DB_PASSWORD', variable: 'DB_PASSWORD'),
-                    string(credentialsId: 'STAGE_DB_CONNECT', variable: 'DB_CONNECT'),
-                    file(credentialsId: 'STAGE_WALLET_FILE', variable: 'WALLET_FILE')
-                ]) {
-                    sh '''
-                        set +x
+    when {
+        branch 'stage'
+    }
+    steps {
+        withCredentials([
+            string(credentialsId: 'STAGE_DB_USER', variable: 'DB_USER'),
+            string(credentialsId: 'STAGE_DB_PASSWORD', variable: 'DB_PASSWORD'),
+            string(credentialsId: 'STAGE_DB_CONNECT', variable: 'DB_CONNECT'),
+            file(credentialsId: 'STAGE_WALLET_FILE', variable: 'WALLET_FILE'),
+            string(credentialsId: 'STAGE_APEX_WORKSPACE', variable: 'APEX_WORKSPACE'),
+            string(credentialsId: 'STAGE_APEX_SCHEMA', variable: 'APEX_SCHEMA')
+        ]) {
+            sh '''
+                set +x
 
-                        echo "Deploying APEX application to STAGE..."
+                echo "Deploying APEX application to STAGE..."
 
-                        rm -rf wallet
-                        mkdir -p wallet
+                if [ -z "$APEX_WORKSPACE" ]; then
+                    echo "ERROR: STAGE_APEX_WORKSPACE is empty or not bound in Jenkinsfile."
+                    exit 1
+                fi
 
-                        cp "$WALLET_FILE" wallet.zip
-                        unzip -o wallet.zip -d wallet > /dev/null
+                if [ -z "$APEX_SCHEMA" ]; then
+                    echo "ERROR: STAGE_APEX_SCHEMA is empty or not bound in Jenkinsfile."
+                    exit 1
+                fi
 
-                        export TNS_ADMIN="$PWD/wallet"
+                echo "Target APEX workspace: $APEX_WORKSPACE"
+                echo "Target APEX schema: $APEX_SCHEMA"
 
-                        echo "Using TNS_ADMIN=$TNS_ADMIN"
-                        echo "Deploying SQL file: ${APEX_SQL_FILE}"
+                rm -rf wallet
+                mkdir -p wallet
 
-sql -L -S /nolog <<EOF
+                cp "$WALLET_FILE" wallet.zip
+                unzip -o wallet.zip -d wallet > /dev/null
+
+                export TNS_ADMIN="$PWD/wallet"
+
+                echo "Using TNS_ADMIN=$TNS_ADMIN"
+                echo "Deploying SQL file: ${APEX_SQL_FILE}"
+
+                sql -L -S /nolog <<EOF
 connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
@@ -194,8 +209,11 @@ begin
         p_workspace => upper('${APEX_WORKSPACE}')
     );
 
+    dbms_output.put_line('Resolved workspace id = ' || l_workspace_id);
+    dbms_output.put_line('Target schema = ${APEX_SCHEMA}');
+
     apex_application_install.set_workspace_id(l_workspace_id);
-    apex_application_install.set_schema('${APEX_SCHEMA}');
+    apex_application_install.set_schema(upper('${APEX_SCHEMA}'));
     apex_application_install.set_application_id(100);
 end;
 /
@@ -204,11 +222,11 @@ end;
 exit
 EOF
 
-                        echo "STAGE deployment completed successfully."
-                    '''
-                }
-            }
+                echo "STAGE deployment completed successfully."
+            '''
         }
+    }
+}
 
         stage('Deploy to DEPLOYMENT') {
             when {
