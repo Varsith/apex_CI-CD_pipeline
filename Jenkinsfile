@@ -132,10 +132,11 @@ pipeline {
 
                         export TNS_ADMIN="$PWD/wallet"
 
-                        echo "Using TNS_ADMIN=$TNS_ADMIN"
-                        echo "Deploying SQL file: ${APEX_SQL_FILE}"
+echo "Using TNS_ADMIN=$TNS_ADMIN"
+echo "Deploying SQL file: ${APEX_SQL_FILE}"
 
-                        sql -L -S "${DB_USER}/${DB_PASSWORD}@${DB_CONNECT}" <<EOF
+sql -L -S /nolog <<EOF
+connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
 set sqlblanklines on
@@ -143,6 +144,8 @@ set serveroutput on
 @${APEX_SQL_FILE}
 exit
 EOF
+
+echo "DEV deployment completed successfully."
 
                         echo "DEV deployment completed successfully."
                     '''
@@ -177,11 +180,20 @@ EOF
                         echo "Using TNS_ADMIN=$TNS_ADMIN"
                         echo "Deploying SQL file: ${APEX_SQL_FILE}"
 
-                        sql -L -S "${DB_USER}/${DB_PASSWORD}@${DB_CONNECT}" <<EOF
+sql -L -S /nolog <<EOF
+connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
 set sqlblanklines on
 set serveroutput on
+
+begin
+    apex_application_install.set_workspace('${APEX_WORKSPACE}');
+    apex_application_install.set_schema('${APEX_SCHEMA}');
+    apex_application_install.set_application_id(100);
+end;
+/
+
 @${APEX_SQL_FILE}
 exit
 EOF
@@ -219,11 +231,20 @@ EOF
                         echo "Using TNS_ADMIN=$TNS_ADMIN"
                         echo "Deploying SQL file: ${APEX_SQL_FILE}"
 
-                        sql -L -S "${DB_USER}/${DB_PASSWORD}@${DB_CONNECT}" <<EOF
+sql -L -S /nolog <<EOF
+connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
 set sqlblanklines on
 set serveroutput on
+
+begin
+    apex_application_install.set_workspace('${APEX_WORKSPACE}');
+    apex_application_install.set_schema('${APEX_SCHEMA}');
+    apex_application_install.set_application_id(100);
+end;
+/
+
 @${APEX_SQL_FILE}
 exit
 EOF
@@ -234,20 +255,30 @@ EOF
             }
         }
 
-        stage('Install Python Dependencies') {
-            when {
-                branch 'dev'
-            }
-            steps {
-                sh '''
-                    echo "Installing Python dependencies..."
+stage('Install Python Dependencies') {
+    when {
+        branch 'dev'
+    }
+    steps {
+        sh '''
+            echo "Creating Python virtual environment..."
 
-                    python3 -m pip install --user -r requirements.txt
+            rm -rf .venv
+            python3 -m venv .venv
 
-                    echo "Python dependencies installed."
-                '''
-            }
-        }
+            echo "Activating virtual environment..."
+            . .venv/bin/activate
+
+            echo "Upgrading pip..."
+            python -m pip install --upgrade pip
+
+            echo "Installing Python dependencies..."
+            python -m pip install -r requirements.txt
+
+            echo "Python dependencies installed inside virtual environment."
+        '''
+    }
+}
 
         stage('Generate Playwright Tests using OCI GenAI') {
             when {
@@ -282,7 +313,8 @@ EOF
                         export OCI_CHAT_MODEL_ID="$OCI_CHAT_MODEL_ID"
 
                         echo "Generating Playwright tests..."
-                        python3 scripts/generate_playwright_tests.py
+                        . .venv/bin/activate
+python scripts/generate_playwright_tests.py
 
                         if [ ! -f "${GENERATED_TEST_FILE}" ]; then
                             echo "ERROR: Playwright test was not generated."
@@ -306,7 +338,7 @@ EOF
                     npm install
 
                     echo "Installing Playwright Chromium browser..."
-                    npx playwright install --with-deps chromium
+                    npx playwright install chromium
 
                     echo "Playwright dependencies installed."
                 '''
