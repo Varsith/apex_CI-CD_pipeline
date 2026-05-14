@@ -117,12 +117,30 @@ pipeline {
                     string(credentialsId: 'DEV_DB_USER', variable: 'DB_USER'),
                     string(credentialsId: 'DEV_DB_PASSWORD', variable: 'DB_PASSWORD'),
                     string(credentialsId: 'DEV_DB_CONNECT', variable: 'DB_CONNECT'),
-                    file(credentialsId: 'DEV_WALLET_FILE', variable: 'WALLET_FILE')
+                    file(credentialsId: 'DEV_WALLET_FILE', variable: 'WALLET_FILE'),
+                    string(credentialsId: 'DEV_APEX_WORKSPACE', variable: 'APEX_WORKSPACE'),
+                    string(credentialsId: 'DEV_APEX_SCHEMA', variable: 'APEX_SCHEMA'),
+                    string(credentialsId: 'DEV_APEX_APP_ID', variable: 'APEX_APP_ID')
                 ]) {
                     sh '''
                         set +x
 
                         echo "Deploying APEX application to DEV..."
+
+                        if [ -z "$APEX_WORKSPACE" ]; then
+                            echo "ERROR: DEV_APEX_WORKSPACE is empty or not bound."
+                            exit 1
+                        fi
+
+                        if [ -z "$APEX_SCHEMA" ]; then
+                            echo "ERROR: DEV_APEX_SCHEMA is empty or not bound."
+                            exit 1
+                        fi
+
+                        if [ -z "$APEX_APP_ID" ]; then
+                            echo "ERROR: DEV_APEX_APP_ID is empty or not bound."
+                            exit 1
+                        fi
 
                         rm -rf wallet
                         mkdir -p wallet
@@ -132,70 +150,13 @@ pipeline {
 
                         export TNS_ADMIN="$PWD/wallet"
 
-echo "Using TNS_ADMIN=$TNS_ADMIN"
-echo "Deploying SQL file: ${APEX_SQL_FILE}"
+                        echo "Using TNS_ADMIN=$TNS_ADMIN"
+                        echo "Deploying SQL file: ${APEX_SQL_FILE}"
+                        echo "Target APEX workspace: $APEX_WORKSPACE"
+                        echo "Target APEX schema: $APEX_SCHEMA"
+                        echo "Target APEX app ID: $APEX_APP_ID"
 
-sql -L -S /nolog <<EOF
-connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
-whenever sqlerror exit sql.sqlcode
-set define off
-set sqlblanklines on
-set serveroutput on
-@${APEX_SQL_FILE}
-exit
-EOF
-
-echo "DEV deployment completed successfully."
-
-                        echo "DEV deployment completed successfully."
-                    '''
-                }
-            }
-        }
-
-        stage('Deploy to STAGE') {
-    when {
-        branch 'stage'
-    }
-    steps {
-        withCredentials([
-            string(credentialsId: 'STAGE_DB_USER', variable: 'DB_USER'),
-            string(credentialsId: 'STAGE_DB_PASSWORD', variable: 'DB_PASSWORD'),
-            string(credentialsId: 'STAGE_DB_CONNECT', variable: 'DB_CONNECT'),
-            file(credentialsId: 'STAGE_WALLET_FILE', variable: 'WALLET_FILE'),
-            string(credentialsId: 'STAGE_APEX_WORKSPACE', variable: 'APEX_WORKSPACE'),
-            string(credentialsId: 'STAGE_APEX_SCHEMA', variable: 'APEX_SCHEMA')
-        ]) {
-            sh '''
-                set +x
-
-                echo "Deploying APEX application to STAGE..."
-
-                if [ -z "$APEX_WORKSPACE" ]; then
-                    echo "ERROR: STAGE_APEX_WORKSPACE is empty or not bound in Jenkinsfile."
-                    exit 1
-                fi
-
-                if [ -z "$APEX_SCHEMA" ]; then
-                    echo "ERROR: STAGE_APEX_SCHEMA is empty or not bound in Jenkinsfile."
-                    exit 1
-                fi
-
-                echo "Target APEX workspace: $APEX_WORKSPACE"
-                echo "Target APEX schema: $APEX_SCHEMA"
-
-                rm -rf wallet
-                mkdir -p wallet
-
-                cp "$WALLET_FILE" wallet.zip
-                unzip -o wallet.zip -d wallet > /dev/null
-
-                export TNS_ADMIN="$PWD/wallet"
-
-                echo "Using TNS_ADMIN=$TNS_ADMIN"
-                echo "Deploying SQL file: ${APEX_SQL_FILE}"
-
-                sql -L -S /nolog <<EOF
+                        sql -L -S /nolog <<EOF
 connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
@@ -211,10 +172,11 @@ begin
 
     dbms_output.put_line('Resolved workspace id = ' || l_workspace_id);
     dbms_output.put_line('Target schema = ${APEX_SCHEMA}');
+    dbms_output.put_line('Target app id = ${APEX_APP_ID}');
 
     apex_application_install.set_workspace_id(l_workspace_id);
     apex_application_install.set_schema(upper('${APEX_SCHEMA}'));
-    apex_application_install.set_application_id(100);
+    apex_application_install.set_application_id(${APEX_APP_ID});
 end;
 /
 
@@ -222,27 +184,45 @@ end;
 exit
 EOF
 
-                echo "STAGE deployment completed successfully."
-            '''
+                        echo "DEV deployment completed successfully."
+                    '''
+                }
+            }
         }
-    }
-}
 
-        stage('Deploy to DEPLOYMENT') {
+        stage('Deploy to STAGE') {
             when {
-                branch 'deployment'
+                branch 'stage'
             }
             steps {
                 withCredentials([
-                    string(credentialsId: 'PROD_DB_USER', variable: 'DB_USER'),
-                    string(credentialsId: 'PROD_DB_PASSWORD', variable: 'DB_PASSWORD'),
-                    string(credentialsId: 'PROD_DB_CONNECT', variable: 'DB_CONNECT'),
-                    file(credentialsId: 'PROD_WALLET_FILE', variable: 'WALLET_FILE')
+                    string(credentialsId: 'STAGE_DB_USER', variable: 'DB_USER'),
+                    string(credentialsId: 'STAGE_DB_PASSWORD', variable: 'DB_PASSWORD'),
+                    string(credentialsId: 'STAGE_DB_CONNECT', variable: 'DB_CONNECT'),
+                    file(credentialsId: 'STAGE_WALLET_FILE', variable: 'WALLET_FILE'),
+                    string(credentialsId: 'STAGE_APEX_WORKSPACE', variable: 'APEX_WORKSPACE'),
+                    string(credentialsId: 'STAGE_APEX_SCHEMA', variable: 'APEX_SCHEMA'),
+                    string(credentialsId: 'STAGE_APEX_APP_ID', variable: 'APEX_APP_ID')
                 ]) {
                     sh '''
                         set +x
 
-                        echo "Deploying APEX application to DEPLOYMENT..."
+                        echo "Deploying APEX application to STAGE..."
+
+                        if [ -z "$APEX_WORKSPACE" ]; then
+                            echo "ERROR: STAGE_APEX_WORKSPACE is empty or not bound."
+                            exit 1
+                        fi
+
+                        if [ -z "$APEX_SCHEMA" ]; then
+                            echo "ERROR: STAGE_APEX_SCHEMA is empty or not bound."
+                            exit 1
+                        fi
+
+                        if [ -z "$APEX_APP_ID" ]; then
+                            echo "ERROR: STAGE_APEX_APP_ID is empty or not bound."
+                            exit 1
+                        fi
 
                         rm -rf wallet
                         mkdir -p wallet
@@ -254,8 +234,11 @@ EOF
 
                         echo "Using TNS_ADMIN=$TNS_ADMIN"
                         echo "Deploying SQL file: ${APEX_SQL_FILE}"
+                        echo "Target APEX workspace: $APEX_WORKSPACE"
+                        echo "Target APEX schema: $APEX_SCHEMA"
+                        echo "Target APEX app ID: $APEX_APP_ID"
 
-sql -L -S /nolog <<EOF
+                        sql -L -S /nolog <<EOF
 connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
@@ -269,9 +252,95 @@ begin
         p_workspace => upper('${APEX_WORKSPACE}')
     );
 
+    dbms_output.put_line('Resolved workspace id = ' || l_workspace_id);
+    dbms_output.put_line('Target schema = ${APEX_SCHEMA}');
+    dbms_output.put_line('Target app id = ${APEX_APP_ID}');
+
     apex_application_install.set_workspace_id(l_workspace_id);
-    apex_application_install.set_schema('${APEX_SCHEMA}');
-    apex_application_install.set_application_id(100);
+    apex_application_install.set_schema(upper('${APEX_SCHEMA}'));
+    apex_application_install.set_application_id(${APEX_APP_ID});
+end;
+/
+
+@${APEX_SQL_FILE}
+exit
+EOF
+
+                        echo "STAGE deployment completed successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to DEPLOYMENT') {
+            when {
+                branch 'deployment'
+            }
+            steps {
+                withCredentials([
+                    string(credentialsId: 'PROD_DB_USER', variable: 'DB_USER'),
+                    string(credentialsId: 'PROD_DB_PASSWORD', variable: 'DB_PASSWORD'),
+                    string(credentialsId: 'PROD_DB_CONNECT', variable: 'DB_CONNECT'),
+                    file(credentialsId: 'PROD_WALLET_FILE', variable: 'WALLET_FILE'),
+                    string(credentialsId: 'PROD_APEX_WORKSPACE', variable: 'APEX_WORKSPACE'),
+                    string(credentialsId: 'PROD_APEX_SCHEMA', variable: 'APEX_SCHEMA'),
+                    string(credentialsId: 'PROD_APEX_APP_ID', variable: 'APEX_APP_ID')
+                ]) {
+                    sh '''
+                        set +x
+
+                        echo "Deploying APEX application to DEPLOYMENT..."
+
+                        if [ -z "$APEX_WORKSPACE" ]; then
+                            echo "ERROR: PROD_APEX_WORKSPACE is empty or not bound."
+                            exit 1
+                        fi
+
+                        if [ -z "$APEX_SCHEMA" ]; then
+                            echo "ERROR: PROD_APEX_SCHEMA is empty or not bound."
+                            exit 1
+                        fi
+
+                        if [ -z "$APEX_APP_ID" ]; then
+                            echo "ERROR: PROD_APEX_APP_ID is empty or not bound."
+                            exit 1
+                        fi
+
+                        rm -rf wallet
+                        mkdir -p wallet
+
+                        cp "$WALLET_FILE" wallet.zip
+                        unzip -o wallet.zip -d wallet > /dev/null
+
+                        export TNS_ADMIN="$PWD/wallet"
+
+                        echo "Using TNS_ADMIN=$TNS_ADMIN"
+                        echo "Deploying SQL file: ${APEX_SQL_FILE}"
+                        echo "Target APEX workspace: $APEX_WORKSPACE"
+                        echo "Target APEX schema: $APEX_SCHEMA"
+                        echo "Target APEX app ID: $APEX_APP_ID"
+
+                        sql -L -S /nolog <<EOF
+connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
+whenever sqlerror exit sql.sqlcode
+set define off
+set sqlblanklines on
+set serveroutput on
+
+declare
+    l_workspace_id number;
+begin
+    l_workspace_id := apex_util.find_security_group_id(
+        p_workspace => upper('${APEX_WORKSPACE}')
+    );
+
+    dbms_output.put_line('Resolved workspace id = ' || l_workspace_id);
+    dbms_output.put_line('Target schema = ${APEX_SCHEMA}');
+    dbms_output.put_line('Target app id = ${APEX_APP_ID}');
+
+    apex_application_install.set_workspace_id(l_workspace_id);
+    apex_application_install.set_schema(upper('${APEX_SCHEMA}'));
+    apex_application_install.set_application_id(${APEX_APP_ID});
 end;
 /
 
@@ -285,30 +354,30 @@ EOF
             }
         }
 
-stage('Install Python Dependencies') {
-    when {
-        branch 'dev'
-    }
-    steps {
-        sh '''
-            echo "Creating Python virtual environment..."
+        stage('Install Python Dependencies') {
+            when {
+                branch 'dev'
+            }
+            steps {
+                sh '''
+                    echo "Creating Python virtual environment..."
 
-            rm -rf .venv
-            python3 -m venv .venv
+                    rm -rf .venv
+                    python3 -m venv .venv
 
-            echo "Activating virtual environment..."
-            . .venv/bin/activate
+                    echo "Activating virtual environment..."
+                    . .venv/bin/activate
 
-            echo "Upgrading pip..."
-            python -m pip install --upgrade pip
+                    echo "Upgrading pip..."
+                    python -m pip install --upgrade pip
 
-            echo "Installing Python dependencies..."
-            python -m pip install -r requirements.txt
+                    echo "Installing Python dependencies..."
+                    python -m pip install -r requirements.txt
 
-            echo "Python dependencies installed inside virtual environment."
-        '''
-    }
-}
+                    echo "Python dependencies installed inside virtual environment."
+                '''
+            }
+        }
 
         stage('Generate Playwright Tests using OCI GenAI') {
             when {
@@ -343,8 +412,9 @@ stage('Install Python Dependencies') {
                         export OCI_CHAT_MODEL_ID="$OCI_CHAT_MODEL_ID"
 
                         echo "Generating Playwright tests..."
+
                         . .venv/bin/activate
-python scripts/generate_playwright_tests.py
+                        python scripts/generate_playwright_tests.py
 
                         if [ ! -f "${GENERATED_TEST_FILE}" ]; then
                             echo "ERROR: Playwright test was not generated."
