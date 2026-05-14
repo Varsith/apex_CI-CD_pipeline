@@ -177,7 +177,7 @@ begin
     apex_application_install.set_workspace_id(l_workspace_id);
     apex_application_install.set_schema(upper('${APEX_SCHEMA}'));
     apex_application_install.set_application_id(${APEX_APP_ID});
-    apex_application_install.set_application_alias('PAGE_VIEW_' || '${APEX_APP_ID}');
+    apex_application_install.set_application_alias('PAGE_VIEW');
 apex_application_install.generate_offset;
 end;
 /
