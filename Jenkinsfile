@@ -180,11 +180,20 @@ echo "DEV deployment completed successfully."
                         echo "Using TNS_ADMIN=$TNS_ADMIN"
                         echo "Deploying SQL file: ${APEX_SQL_FILE}"
 
-                        sql -L -S "${DB_USER}/${DB_PASSWORD}@${DB_CONNECT}" <<EOF
+sql -L -S /nolog <<EOF
+connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
 set sqlblanklines on
 set serveroutput on
+
+begin
+    apex_application_install.set_workspace('${APEX_WORKSPACE}');
+    apex_application_install.set_schema('${APEX_SCHEMA}');
+    apex_application_install.set_application_id(100);
+end;
+/
+
 @${APEX_SQL_FILE}
 exit
 EOF
@@ -222,11 +231,20 @@ EOF
                         echo "Using TNS_ADMIN=$TNS_ADMIN"
                         echo "Deploying SQL file: ${APEX_SQL_FILE}"
 
-                        sql -L -S "${DB_USER}/${DB_PASSWORD}@${DB_CONNECT}" <<EOF
+sql -L -S /nolog <<EOF
+connect ${DB_USER}/"${DB_PASSWORD}"@${DB_CONNECT}
 whenever sqlerror exit sql.sqlcode
 set define off
 set sqlblanklines on
 set serveroutput on
+
+begin
+    apex_application_install.set_workspace('${APEX_WORKSPACE}');
+    apex_application_install.set_schema('${APEX_SCHEMA}');
+    apex_application_install.set_application_id(100);
+end;
+/
+
 @${APEX_SQL_FILE}
 exit
 EOF
