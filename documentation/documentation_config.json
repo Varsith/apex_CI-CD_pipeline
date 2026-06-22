@@ -1,0 +1,75 @@
+{
+  "application": {
+    "purpose": "Describe the purpose of this Oracle APEX application here.",
+    "business_problem": "Describe the business problem this application solves here.",
+    "target_users": [
+      "Business users",
+      "Administrators"
+    ],
+    "key_features": [],
+    "scope": "Generated from the APEX SQL export. Update this field with business-specific scope.",
+    "limitations": [
+      "Generated documentation depends on metadata present in the APEX SQL export."
+    ]
+  },
+  "architecture": {
+    "frontend": "Oracle APEX web UI",
+    "backend": "Oracle APEX runtime, PL/SQL processes, validations, and dynamic actions",
+    "database": "Oracle Database / APEX parsing schema",
+    "cloud_infrastructure": "Oracle Cloud Infrastructure / ORDS / APEX service as configured by the environment",
+    "third_party_integrations": []
+  },
+  "api": {
+    "exposes_apis": "auto",
+    "base_url": "",
+    "authentication": "Use environment-specific authentication. Update if REST APIs are exposed.",
+    "rate_limits": "Not found in SQL export. Define manually if applicable.",
+    "error_codes": [
+      "HTTP 400",
+      "HTTP 401",
+      "HTTP 403",
+      "HTTP 404",
+      "HTTP 429",
+      "HTTP 500"
+    ]
+  },
+  "security": {
+    "authentication_method": "Oracle APEX authentication scheme, SSO, or custom authentication as extracted/configured.",
+    "authorization_roles": [],
+    "encryption_details": "Use HTTPS/TLS in transit. Database encryption depends on OCI/DB configuration.",
+    "audit_logging": "Review APEX activity logs, custom audit tables, and database auditing.",
+    "best_practices": [
+      "Never commit credentials to source control.",
+      "Use Jenkins credentials binding for secrets.",
+      "Validate server-side authorization for all sensitive pages and processes.",
+      "Avoid exposing ORA-/ERR- details to end users.",
+      "Keep APEX, ORDS, and database patches current."
+    ]
+  },
+  "user_guide": {
+    "include_screenshot_placeholders": true,
+    "faq": [
+      {
+        "question": "How do I access the application?",
+        "answer": "Use the environment-specific APEX URL."
+      },
+      {
+        "question": "What should I do if login fails?",
+        "answer": "Check credentials, workspace access, and account status."
+      }
+    ],
+    "troubleshooting": [
+      "Refresh the page and try again.",
+      "Confirm required fields are filled.",
+      "Contact the application administrator if APEX or ORA errors appear."
+    ]
+  },
+  "sections": {
+    "overview": true,
+    "system_architecture": true,
+    "user_guide": true,
+    "api_documentation": true,
+    "database_documentation": true,
+    "security_documentation": true
+  }
+}
