@@ -11,6 +11,11 @@ pipeline {
         APEX_SQL_FILE = 'apex/f100.sql'
         DEV_CONFIG_FILE = 'config/dev.json'
         GENERATED_TEST_FILE = 'tests/generated/generated_apex_test.spec.ts'
+        DOC_CONFIG_FILE = 'documentation/documentation_config.json'
+        DOC_OUTPUT_DIR = 'documentation/generated'
+        GENERATED_DOC_TXT = 'documentation/generated/application_documentation.txt'
+        GENERATED_DOC_MD = 'documentation/generated/application_documentation.md'
+        GENERATED_DOC_ZIP = 'documentation/generated/application_documentation_bundle.zip'
     }
 
     stages {
@@ -39,6 +44,13 @@ pipeline {
                     if [ ! -f "scripts/generate_playwright_tests.py" ]; then
                         echo "ERROR: Missing scripts/generate_playwright_tests.py"
                         exit 1
+                    fi
+
+                    if [ "${BRANCH_NAME}" = "deployment" ]; then
+                        if [ ! -f "scripts/generate_apex_documentation.py" ]; then
+                            echo "ERROR: deployment branch requires scripts/generate_apex_documentation.py"
+                            exit 1
+                        fi
                     fi
 
                     if [ ! -f "package.json" ]; then
@@ -100,6 +112,11 @@ pipeline {
 
                     unzip -v || {
                         echo "ERROR: unzip is not installed."
+                        exit 1
+                    }
+
+                    zip -v || {
+                        echo "ERROR: zip is not installed."
                         exit 1
                     }
 
@@ -177,7 +194,7 @@ begin
     apex_application_install.set_workspace_id(l_workspace_id);
     apex_application_install.set_schema(upper('${APEX_SCHEMA}'));
     apex_application_install.set_application_id(${APEX_APP_ID});
-    apex_application_install.set_application_alias('PAGE_VIEW_' || '${APEX_APP_ID}');
+    apex_application_install.set_application_alias('PAGE_VIEW');
 apex_application_install.generate_offset;
 end;
 /
@@ -362,7 +379,10 @@ EOF
 
         stage('Install Python Dependencies') {
             when {
-                branch 'dev'
+                anyOf {
+                    branch 'dev'
+                    branch 'deployment'
+                }
             }
             steps {
                 sh '''
@@ -434,6 +454,71 @@ EOF
             }
         }
 
+
+
+        stage('Generate Deployment Documentation using OCI GenAI') {
+            when {
+                branch 'deployment'
+            }
+            steps {
+                withCredentials([
+                    file(credentialsId: 'OCI_CONFIG_FILE', variable: 'OCI_CONFIG_FILE_SECRET'),
+                    file(credentialsId: 'OCI_PRIVATE_KEY_FILE', variable: 'OCI_PRIVATE_KEY_SECRET'),
+                    string(credentialsId: 'OCI_COMPARTMENT_ID', variable: 'OCI_COMPARTMENT_ID'),
+                    string(credentialsId: 'OCI_GENAI_ENDPOINT', variable: 'OCI_GENAI_ENDPOINT'),
+                    string(credentialsId: 'OCI_CHAT_MODEL_ID', variable: 'OCI_CHAT_MODEL_ID')
+                ]) {
+                    sh '''
+                        set +x
+
+                        echo "Preparing OCI config for documentation GenAI script..."
+
+                        rm -rf .oci
+                        mkdir -p .oci
+
+                        cp "$OCI_CONFIG_FILE_SECRET" .oci/config
+                        cp "$OCI_PRIVATE_KEY_SECRET" .oci/oci_api_key.pem
+
+                        chmod 600 .oci/config
+                        chmod 600 .oci/oci_api_key.pem
+
+                        export OCI_CONFIG_FILE_PATH="$PWD/.oci/config"
+                        export OCI_CONFIG_PROFILE="DEFAULT"
+                        export OCI_COMPARTMENT_ID="$OCI_COMPARTMENT_ID"
+                        export OCI_GENAI_ENDPOINT="$OCI_GENAI_ENDPOINT"
+                        export OCI_CHAT_MODEL_ID="$OCI_CHAT_MODEL_ID"
+
+                        export APEX_SQL_FILE="$PWD/${APEX_SQL_FILE}"
+                        export DOC_CONFIG_FILE="$PWD/${DOC_CONFIG_FILE}"
+                        export DOC_OUTPUT_DIR="$PWD/${DOC_OUTPUT_DIR}"
+
+                        echo "Generating deployment documentation..."
+
+                        . .venv/bin/activate
+                        python scripts/generate_apex_documentation.py
+
+                        if [ ! -f "${GENERATED_DOC_TXT}" ]; then
+                            echo "ERROR: Documentation TXT was not generated: ${GENERATED_DOC_TXT}"
+                            exit 1
+                        fi
+
+                        if [ ! -f "${GENERATED_DOC_MD}" ]; then
+                            echo "ERROR: Documentation Markdown was not generated: ${GENERATED_DOC_MD}"
+                            exit 1
+                        fi
+
+                        if [ ! -f "${GENERATED_DOC_ZIP}" ]; then
+                            echo "ERROR: Documentation ZIP bundle was not generated: ${GENERATED_DOC_ZIP}"
+                            exit 1
+                        fi
+
+                        echo "Generated documentation artifacts:"
+                        ls -la "${DOC_OUTPUT_DIR}"
+                    '''
+                }
+            }
+        }
+
         stage('Install Playwright Dependencies') {
             when {
                 branch 'dev'
@@ -480,6 +565,7 @@ EOF
             echo "Pipeline completed for branch: ${BRANCH_NAME}"
 
             archiveArtifacts artifacts: 'tests/generated/*.ts', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'documentation/generated/**', allowEmptyArchive: true
             archiveArtifacts artifacts: 'playwright-report/**', allowEmptyArchive: true
             archiveArtifacts artifacts: 'test-results/**', allowEmptyArchive: true
 
