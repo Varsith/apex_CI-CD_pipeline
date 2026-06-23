@@ -1,20 +1,20 @@
 {
   "application": {
-    "name": "Oracle APEX Application",
-    "purpose": "Describe the purpose of this Oracle APEX application.",
-    "business_problem": "Describe the business problem solved by this application.",
+    "purpose": "Oracle APEX application generated from the deployment SQL export.",
+    "business_problem": "Update this value with the actual business problem solved by the application.",
     "target_users": [
       "End users",
       "Application administrators"
     ],
     "key_features": [
-      "Generated page-by-page documentation from the deployment SQL export",
-      "Architecture, API, database, security, and user guide sections in one file"
+      "Oracle APEX page-based user interface",
+      "Generated page-by-page technical documentation from SQL export",
+      "Generated architecture, user guide, API, database, and security documentation in one combined file"
     ],
-    "scope": "Documentation is generated from the APEX SQL file deployed by the Jenkins deployment branch.",
+    "scope": "This documentation is generated from the APEX SQL file used in the deployment branch.",
     "limitations": [
       "Only metadata present in the APEX SQL export can be extracted automatically.",
-      "Screenshots, exact business process descriptions, external system contracts, and infrastructure diagrams should be updated manually when needed."
+      "Business descriptions, screenshots, non-exported database objects, external API contracts, and infrastructure details should be maintained manually in this config file."
     ]
   },
   "architecture": {
@@ -25,10 +25,8 @@
     "third_party_integrations": []
   },
   "api": {
-    "exposes_apis": "auto",
-    "base_url": "",
-    "authentication": "Document API authentication here if REST/ORDS APIs are exposed, for example OAuth2, Basic Auth, APEX session, or API gateway token.",
-    "rate_limits": "Not defined in SQL export. Define manually if ORDS/API gateway/service-level limits are configured.",
+    "authentication": "Environment-specific authentication. Update this if REST/ORDS APIs are exposed.",
+    "rate_limits": "Not defined in the APEX SQL export. Define limits here if ORDS, API Gateway, or service-level throttling is configured.",
     "error_codes": [
       "400 Bad Request",
       "401 Unauthorized",
@@ -39,7 +37,7 @@
     ]
   },
   "security": {
-    "authentication_method": "Use the extracted APEX authentication scheme, SSO, custom authentication, or environment-specific login method.",
+    "authentication_method": "Use the extracted APEX authentication scheme when present. Update this if SSO, custom authentication, or environment-specific login is used.",
     "authorization_roles": [],
     "encryption_details": "Use HTTPS/TLS in transit. Database encryption depends on the configured Oracle Database/OCI environment.",
     "audit_logging": "Review APEX activity logs, custom audit tables, and database auditing configuration.",

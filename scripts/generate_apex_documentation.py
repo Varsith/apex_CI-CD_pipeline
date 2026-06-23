@@ -1,25 +1,24 @@
 # coding: utf-8
 """
-Oracle APEX SQL to Deployment Documentation Generator
-CI/CD / Jenkins / OCI GenAI compatible edition
+Oracle APEX SQL to Documentation Generator - SQL-first CI/CD edition
 
-This generator is intentionally SQL-first and deterministic. It reads the exact
-APEX SQL export for the branch build and creates one combined documentation file
-for the whole application, with page-by-page documentation inside the same file.
+Place this file at: scripts/generate_apex_documentation.py
+Run from Jenkins after deployment branch deployment.
 
 Generated artifacts:
 - documentation/generated/application_documentation.md
 - documentation/generated/application_documentation.txt
 - documentation/generated/apex_metadata.json
 - documentation/generated/architecture_diagram.svg
-- documentation/generated/architecture_diagram.mmd
 - documentation/generated/architecture_diagram.html
+- documentation/generated/architecture_diagram.mmd
 - documentation/generated/application_documentation_bundle.zip
 
-Optional OCI GenAI:
-If OCI credentials are present, the script can ask OCI GenAI to polish short
-business summaries, but extracted technical details always come from the SQL file.
-If OCI is unavailable or fails, the documentation is still generated.
+Important design choices:
+- Technical content is extracted from the exact APEX SQL export.
+- Documentation is one combined .md/.txt file with all pages inside it.
+- Architecture diagram is generated locally as SVG/HTML. It does not depend on OCI GenAI image output or Mermaid rendering.
+- Mermaid .mmd is also generated as a secondary artifact using safe syntax.
 """
 
 from __future__ import annotations
@@ -29,23 +28,11 @@ import json
 import os
 import re
 import sys
-import textwrap
 import zipfile
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-try:
-    import oci  # type: ignore
-except Exception:  # pragma: no cover
-    oci = None
-
-CONFIG_PROFILE = os.getenv("OCI_CONFIG_PROFILE", "DEFAULT")
-CONFIG_FILE_PATH = os.getenv("OCI_CONFIG_FILE_PATH", str(Path.home() / ".oci" / "config"))
-COMPARTMENT_ID = os.getenv("OCI_COMPARTMENT_ID", "ocid1.compartment.oc1..aaaaaaaatm34bplxwjpdfrxalb7w633njcl3z2ggblblvetwykljhndxooea")
-ENDPOINT = os.getenv("OCI_GENAI_ENDPOINT", "https://inference.generativeai.us-ashburn-1.oci.oraclecloud.com")
-CHAT_MODEL_ID = os.getenv("OCI_CHAT_MODEL_ID", "ocid1.generativeaimodel.oc1.iad.amaaaaaask7dceyaeo4ehrn25guuats5s45hnvswlhxo6riop275l2bkr2vq")
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 APEX_SQL_FILE = Path(os.getenv("APEX_SQL_FILE", str(ROOT_DIR / "apex" / "f100.sql")))
@@ -55,291 +42,42 @@ OUTPUT_DIR = Path(os.getenv("DOC_OUTPUT_DIR", str(ROOT_DIR / "documentation" / "
 DOC_MD_FILE = OUTPUT_DIR / "application_documentation.md"
 DOC_TXT_FILE = OUTPUT_DIR / "application_documentation.txt"
 METADATA_JSON_FILE = OUTPUT_DIR / "apex_metadata.json"
-ARCH_MMD_FILE = OUTPUT_DIR / "architecture_diagram.mmd"
 ARCH_SVG_FILE = OUTPUT_DIR / "architecture_diagram.svg"
 ARCH_HTML_FILE = OUTPUT_DIR / "architecture_diagram.html"
+ARCH_MMD_FILE = OUTPUT_DIR / "architecture_diagram.mmd"
 DOC_ZIP_FILE = OUTPUT_DIR / "application_documentation_bundle.zip"
 
-MAX_LIST_ITEMS = int(os.getenv("DOC_MAX_LIST_ITEMS", "300"))
-ENABLE_OCI_POLISH = os.getenv("DOC_ENABLE_OCI_POLISH", "false").lower() in {"1", "true", "yes", "y"}
-
-# =============================================================================
-# Data models
-# =============================================================================
-
-@dataclass
-class PageItem:
-    name: str
-    label: str = ""
-    display_as: str = ""
-    source_type: str = ""
-    source: str = ""
-    required: str = ""
-    lov: str = ""
-    default: str = ""
-    help_text: str = ""
-    page_id: str = ""
-
-@dataclass
-class Button:
-    name: str
-    label: str = ""
-    action: str = ""
-    target: str = ""
-    page_id: str = ""
-
-@dataclass
-class Region:
-    name: str
-    template: str = ""
-    source_type: str = ""
-    source: str = ""
-    region_type: str = ""
-    page_id: str = ""
-
-@dataclass
-class Process:
-    name: str
-    process_type: str = ""
-    point: str = ""
-    source: str = ""
-    condition: str = ""
-    page_id: str = ""
-
-@dataclass
-class Validation:
-    name: str
-    validation_type: str = ""
-    item: str = ""
-    error_message: str = ""
-    condition: str = ""
-    page_id: str = ""
-
-@dataclass
-class DynamicAction:
-    name: str
-    event: str = ""
-    when_element: str = ""
-    condition: str = ""
-    page_id: str = ""
-
-@dataclass
-class PageDoc:
-    page_id: str
-    title: str
-    alias: str = ""
-    name: str = ""
-    page_mode: str = ""
-    auth_required: str = ""
-    protection_level: str = ""
-    items: List[PageItem] = field(default_factory=list)
-    buttons: List[Button] = field(default_factory=list)
-    regions: List[Region] = field(default_factory=list)
-    processes: List[Process] = field(default_factory=list)
-    validations: List[Validation] = field(default_factory=list)
-    dynamic_actions: List[DynamicAction] = field(default_factory=list)
-
-@dataclass
-class DbTable:
-    name: str
-    columns: List[Dict[str, str]] = field(default_factory=list)
-    constraints: List[str] = field(default_factory=list)
-    indexes: List[str] = field(default_factory=list)
-
-@dataclass
-class ApiEndpoint:
-    method: str
-    path: str
-    source: str = ""
-    auth: str = ""
-    module: str = ""
-
-# =============================================================================
-# General helpers
-# =============================================================================
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def read_text_file(path: Path, required: bool = True) -> str:
-    if not path.exists():
-        if required:
-            raise FileNotFoundError(f"File not found: {path}")
-        return ""
-    if not path.is_file():
-        raise ValueError(f"Path is not a file: {path}")
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    if required and not text.strip():
-        raise ValueError(f"File is empty: {path}")
-    return text
-
-
-def normalize_sql(text: str) -> str:
-    text = re.sub(r"\r\n?", "\n", text)
-    return text
-
-
-def clean_inline(value: Any, max_len: int = 240) -> str:
-    if value is None:
-        return ""
-    text = str(value)
-    text = text.replace("''", "'")
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > max_len:
-        return text[: max_len - 3].rstrip() + "..."
-    return text
-
-
-def unique(values: Iterable[Any], limit: int = MAX_LIST_ITEMS) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, tuple):
-            value = " ".join(str(v).strip() for v in value if v)
-        value = clean_inline(value, max_len=500)
-        if not value:
-            continue
-        key = value.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(value)
-        if len(out) >= limit:
-            break
-    return out
-
-
-def regex_find(pattern: str, text: str, limit: int = MAX_LIST_ITEMS) -> List[str]:
-    return unique(re.findall(pattern, text, flags=re.IGNORECASE | re.DOTALL), limit=limit)
-
-
-def first_param(block: str, param: str) -> str:
-    # Handles p_name=>'X', p_name => q'[X]', p_name => nvl('X'), p_id=>123, p_security_scheme=>wwv_flow_api.id(123)
-    patterns = [
-        rf"{re.escape(param)}\s*=>\s*q'\[(.*?)\]'",
-        rf"{re.escape(param)}\s*=>\s*q'\{{(.*?)\}}'",
-        rf"{re.escape(param)}\s*=>\s*'((?:''|[^'])*)'",
-        rf"{re.escape(param)}\s*=>\s*wwv_flow_api\.id\(([0-9]+)\)",
-        rf"{re.escape(param)}\s*=>\s*([0-9]+)",
-        rf"{re.escape(param)}\s*=>\s*([A-Z0-9_\.]+)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, block, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return clean_inline(m.group(1), max_len=1200)
-    return ""
-
-
-def extract_blocks(sql_text: str, api_name: str) -> List[str]:
-    # APEX exports normally use wwv_flow_api.create_xxx(...); but content may contain nested parentheses.
-    # This scanner finds the matching close parenthesis before the semicolon.
-    starts = [m.start() for m in re.finditer(rf"wwv_flow_api\.{re.escape(api_name)}\s*\(", sql_text, flags=re.IGNORECASE)]
-    blocks: List[str] = []
-    for start in starts:
-        open_pos = sql_text.find("(", start)
-        if open_pos < 0:
-            continue
-        depth = 0
-        in_quote = False
-        i = open_pos
-        while i < len(sql_text):
-            ch = sql_text[i]
-            nxt = sql_text[i + 1] if i + 1 < len(sql_text) else ""
-            if ch == "'":
-                # SQL escaped quote: '' inside a string.
-                if in_quote and nxt == "'":
-                    i += 2
-                    continue
-                in_quote = not in_quote
-            elif not in_quote:
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        blocks.append(sql_text[open_pos + 1 : i])
-                        break
-            i += 1
-    return blocks
-
-
-def source_tables_from_text(text: str) -> List[str]:
-    patterns = [
-        r"\bfrom\s+([a-zA-Z][a-zA-Z0-9_$#\.]+)",
-        r"\bjoin\s+([a-zA-Z][a-zA-Z0-9_$#\.]+)",
-        r"\binto\s+([a-zA-Z][a-zA-Z0-9_$#\.]+)",
-        r"\bupdate\s+([a-zA-Z][a-zA-Z0-9_$#\.]+)",
-        r"\bmerge\s+into\s+([a-zA-Z][a-zA-Z0-9_$#\.]+)",
-        r"\bdelete\s+from\s+([a-zA-Z][a-zA-Z0-9_$#\.]+)",
-    ]
-    vals: List[str] = []
-    for pat in patterns:
-        vals.extend(re.findall(pat, text, flags=re.IGNORECASE))
-    ignored = {"select", "dual", "table", "apex_application", "wwv_flow", "sys", "system"}
-    return [v.upper() for v in unique(vals, limit=60) if v.lower() not in ignored]
-
-
-def text_list(values: Iterable[str], none_text: str = "Not found in SQL export.", limit: int = 60) -> str:
-    vals = [v for v in unique(values, limit=limit) if v]
-    if not vals:
-        return f"- {none_text}"
-    return "\n".join(f"- {v}" for v in vals)
-
-
-def md_table(headers: List[str], rows: List[List[Any]], empty: str = "Not found in SQL export.") -> str:
-    if not rows:
-        return empty
-    def esc(x: Any) -> str:
-        s = clean_inline(x, max_len=500)
-        s = s.replace("|", "\\|")
-        return s if s else "-"
-    out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
-    for row in rows:
-        out.append("| " + " | ".join(esc(c) for c in row) + " |")
-    return "\n".join(out)
-
-
-def truncate_code(text: str, max_len: int = 700) -> str:
-    text = clean_inline(text, max_len=max_len)
-    return text
-
-# =============================================================================
-# Config
-# =============================================================================
+MAX_ROWS = int(os.getenv("DOC_MAX_ROWS", "500"))
+MAX_SOURCE_CHARS = int(os.getenv("DOC_MAX_SOURCE_CHARS", "1200"))
 
 DEFAULT_DOC_CONFIG: Dict[str, Any] = {
     "application": {
         "purpose": "Oracle APEX application generated from the deployment SQL export.",
-        "business_problem": "Update this field with the business problem solved by the application.",
+        "business_problem": "Update this in documentation_config.json with the business problem solved by the application.",
         "target_users": ["End users", "Application administrators"],
         "key_features": [],
-        "scope": "This documentation is generated from the APEX SQL file used in the deployment branch.",
+        "scope": "Documentation generated from the APEX SQL file deployed by the deployment branch.",
         "limitations": [
             "Only metadata present in the APEX SQL export can be extracted automatically.",
-            "Business descriptions, screenshots, external system contracts, and non-exported infrastructure details should be maintained in documentation/documentation_config.json."
+            "Business descriptions, screenshots, non-exported database objects, external contracts, and cloud topology should be maintained in documentation_config.json."
         ]
     },
     "architecture": {
         "frontend": "Oracle APEX web user interface",
-        "backend": "Oracle APEX runtime, PL/SQL page processes, validations, dynamic actions, and SQL sources",
+        "backend": "Oracle APEX runtime, page processes, validations, dynamic actions, SQL, and PL/SQL",
         "database": "Oracle Database / APEX parsing schema",
-        "cloud_infrastructure": "Oracle Cloud Infrastructure, ORDS, and APEX runtime environment configured for this deployment",
+        "cloud_infrastructure": "Oracle Cloud Infrastructure / ORDS / APEX runtime environment",
         "third_party_integrations": []
     },
     "api": {
-        "exposes_apis": "auto",
-        "base_url": "",
         "authentication": "Environment-specific authentication. Update when REST APIs are exposed.",
-        "rate_limits": "Not defined in SQL export. Update if API gateway, ORDS, or service-level limits are configured.",
+        "rate_limits": "Not defined in SQL export. Update if ORDS/API gateway/service-level limits are configured.",
         "error_codes": ["400 Bad Request", "401 Unauthorized", "403 Forbidden", "404 Not Found", "429 Too Many Requests", "500 Internal Server Error"]
     },
     "security": {
-        "authentication_method": "Extracted from APEX authentication schemes when present; otherwise update manually.",
+        "authentication_method": "Use extracted APEX authentication scheme when present, otherwise update manually.",
         "authorization_roles": [],
-        "encryption_details": "Use HTTPS/TLS in transit. Database encryption depends on the configured Oracle Database/OCI environment.",
+        "encryption_details": "Use HTTPS/TLS in transit. Database encryption depends on Oracle Database/OCI configuration.",
         "audit_logging": "Review APEX activity logs, custom audit tables, and database auditing configuration.",
         "best_practices": [
             "Store secrets only in Jenkins credentials or OCI Vault, never in source control.",
@@ -353,7 +91,7 @@ DEFAULT_DOC_CONFIG: Dict[str, Any] = {
         "include_screenshot_placeholders": True,
         "faq": [
             {"question": "How do I access the application?", "answer": "Open the environment-specific APEX URL and sign in with an authorized account."},
-            {"question": "What should I do if I see an error?", "answer": "Capture the page, timestamp, and steps taken, then contact the application administrator."}
+            {"question": "What should I do if I see an error?", "answer": "Capture the page name, timestamp, screenshot, and steps taken, then contact the application administrator."}
         ],
         "troubleshooting": [
             "Confirm that all mandatory fields are completed.",
@@ -366,1173 +104,702 @@ DEFAULT_DOC_CONFIG: Dict[str, Any] = {
     "manual_security_notes": []
 }
 
+@dataclass
+class Region:
+    name: str
+    display_point: str = ""
+    source_type: str = ""
+    source: str = ""
+    template: str = ""
 
-def deep_merge(default: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(default)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = deep_merge(merged[key], value)
+@dataclass
+class PageItem:
+    name: str
+    prompt: str = ""
+    display_as: str = ""
+    required: str = ""
+    source_type: str = ""
+    source: str = ""
+    default: str = ""
+    lov: str = ""
+    max_length: str = ""
+    placeholder: str = ""
+    condition: str = ""
+
+@dataclass
+class Button:
+    name: str
+    label: str = ""
+    action: str = ""
+    position: str = ""
+    target: str = ""
+    execute_validations: str = ""
+
+@dataclass
+class Process:
+    name: str
+    process_type: str = ""
+    point: str = ""
+    source: str = ""
+    error_location: str = ""
+    condition: str = ""
+    when_button: str = ""
+
+@dataclass
+class Validation:
+    name: str
+    validation_type: str = ""
+    associated_item: str = ""
+    error_message: str = ""
+    condition: str = ""
+    when_button: str = ""
+
+@dataclass
+class DynamicAction:
+    name: str
+    event: str = ""
+    triggering_element: str = ""
+    condition: str = ""
+
+@dataclass
+class Page:
+    page_id: str
+    name: str = ""
+    alias: str = ""
+    title: str = ""
+    page_mode: str = ""
+    public: str = ""
+    protection_level: str = ""
+    auth_scheme: str = ""
+    regions: List[Region] = field(default_factory=list)
+    items: List[PageItem] = field(default_factory=list)
+    buttons: List[Button] = field(default_factory=list)
+    processes: List[Process] = field(default_factory=list)
+    validations: List[Validation] = field(default_factory=list)
+    dynamic_actions: List[DynamicAction] = field(default_factory=list)
+
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
+def read_text(path: Path, required: bool = True) -> str:
+    if not path.exists():
+        if required:
+            raise FileNotFoundError(f"File not found: {path}")
+        return ""
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def clean(value: Any, max_len: int = 1000) -> str:
+    if value is None:
+        return ""
+    s = str(value)
+    s = s.replace("''", "'")
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        return s[:max_len].rstrip() + " ..."
+    return s
+
+
+def unique(values: List[str], limit: int = MAX_ROWS) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        v = clean(value, max_len=1200)
+        if not v:
+            continue
+        key = v.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(a)
+    for key, val in b.items():
+        if isinstance(val, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], val)
         else:
-            merged[key] = value
-    return merged
+            result[key] = val
+    return result
 
 
-def load_or_create_doc_config() -> Dict[str, Any]:
+def load_config() -> Dict[str, Any]:
     DOC_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not DOC_CONFIG_FILE.exists():
         DOC_CONFIG_FILE.write_text(json.dumps(DEFAULT_DOC_CONFIG, indent=2), encoding="utf-8")
-        print(f"Created default documentation config: {DOC_CONFIG_FILE}")
         return DEFAULT_DOC_CONFIG
-    try:
-        user_config = json.loads(read_text_file(DOC_CONFIG_FILE, required=True))
-    except Exception as exc:
-        raise ValueError(f"Invalid JSON in {DOC_CONFIG_FILE}: {exc}") from exc
-    return deep_merge(DEFAULT_DOC_CONFIG, user_config)
+    return deep_merge(DEFAULT_DOC_CONFIG, json.loads(read_text(DOC_CONFIG_FILE)))
 
-# =============================================================================
-# APEX extraction
-# =============================================================================
 
-def extract_pages(sql_text: str) -> List[PageDoc]:
-    pages: List[PageDoc] = []
-    seen = set()
-    for block in extract_blocks(sql_text, "create_page"):
-        page_id = first_param(block, "p_page_id") or first_param(block, "p_id")
-        title = first_param(block, "p_page_title") or first_param(block, "p_name") or f"Page {page_id or len(pages) + 1}"
-        alias = first_param(block, "p_alias")
-        name = first_param(block, "p_name")
-        key = page_id or title.lower()
-        if key in seen:
+def parse_export_header(sql: str) -> Dict[str, str]:
+    info: Dict[str, str] = {}
+    m = re.search(r"prompt\s+APPLICATION\s+(\d+)\s+-\s+(.+)", sql, flags=re.IGNORECASE)
+    if m:
+        info["application_id"] = m.group(1).strip()
+        info["application_name"] = clean(m.group(2), 200)
+    patterns = {
+        "application_id": r"Application:\s*(\d+)",
+        "application_name": r"Name:\s*(.+)",
+        "exported_at": r"Date and Time:\s*(.+)",
+        "exported_by": r"Exported By:\s*(.+)",
+        "version": r"Version:\s*(.+)",
+        "workspace_id": r"p_default_workspace_id\s*=>\s*(\d+)",
+        "default_owner": r"p_default_owner\s*=>\s*'([^']+)'",
+        "alias": r"p_alias\s*=>\s*nvl\([^,]+,'([^']+)'\)",
+    }
+    for k, pat in patterns.items():
+        m = re.search(pat, sql, flags=re.IGNORECASE)
+        if m and not info.get(k):
+            info[k] = clean(m.group(1), 250)
+    return info
+
+
+def find_calls(sql: str) -> List[Tuple[str, str, str]]:
+    """Return (api_name, args_text, page_context) for wwv_flow_* create calls.
+
+    Handles both old and new exports:
+    - wwv_flow_api.create_page(...)
+    - wwv_flow_imp_page.create_page(...)
+    - wwv_flow_imp_shared.create_list(...)
+
+    Also tracks the active prompt --application/pages/page_00001 section so page
+    components without p_page_id still attach to the correct page.
+    """
+    call_re = re.compile(r"wwv_flow_(?:api|imp|imp_page|imp_shared)\.([a-zA-Z0-9_]+)\s*\(", re.IGNORECASE)
+    prompt_re = re.compile(r"prompt\s+--application/pages/page_(\d+)", re.IGNORECASE)
+    events: List[Tuple[int, str, Optional[re.Match[str]]]] = []
+    for m in call_re.finditer(sql):
+        events.append((m.start(), "call", m))
+    for m in prompt_re.finditer(sql):
+        events.append((m.start(), "prompt", m))
+    events.sort(key=lambda x: x[0])
+    calls: List[Tuple[str, str, str]] = []
+    current_page = ""
+    for _, kind, match in events:
+        if kind == "prompt":
+            current_page = str(int(match.group(1))) if match and match.group(1).isdigit() else (match.group(1) if match else "")
             continue
-        seen.add(key)
-        pages.append(PageDoc(
-            page_id=page_id,
-            title=title,
-            alias=alias,
-            name=name,
-            page_mode=first_param(block, "p_page_mode"),
-            auth_required=first_param(block, "p_authentication"),
-            protection_level=first_param(block, "p_protection_level"),
-        ))
-    pages.sort(key=lambda p: int(p.page_id) if p.page_id.isdigit() else 999999)
-    return pages
-
-
-def page_map(pages: List[PageDoc]) -> Dict[str, PageDoc]:
-    return {p.page_id: p for p in pages if p.page_id}
-
-
-def add_orphan_page(pages: List[PageDoc], page_id: str) -> PageDoc:
-    pm = page_map(pages)
-    if page_id in pm:
-        return pm[page_id]
-    p = PageDoc(page_id=page_id, title=f"Page {page_id}")
-    pages.append(p)
-    return p
-
-
-def extract_page_components(sql_text: str, pages: List[PageDoc]) -> None:
-    pm = page_map(pages)
-
-    for block in extract_blocks(sql_text, "create_page_item"):
-        page_id = first_param(block, "p_page_id")
-        name = first_param(block, "p_name")
-        if not name:
+        if not match:
             continue
-        item = PageItem(
-            name=name,
-            label=first_param(block, "p_prompt") or first_param(block, "p_field_template"),
-            display_as=first_param(block, "p_display_as"),
-            source_type=first_param(block, "p_source_type"),
-            source=first_param(block, "p_source"),
-            required=first_param(block, "p_is_required"),
-            lov=first_param(block, "p_named_lov") or first_param(block, "p_lov"),
-            default=first_param(block, "p_item_default"),
-            help_text=first_param(block, "p_help_text"),
-            page_id=page_id,
-        )
-        (pm.get(page_id) or add_orphan_page(pages, page_id)).items.append(item)
-
-    for block in extract_blocks(sql_text, "create_page_button"):
-        page_id = first_param(block, "p_page_id")
-        name = first_param(block, "p_button_name")
-        if not name:
+        api_name = match.group(1)
+        open_pos = sql.find("(", match.start())
+        if open_pos < 0:
             continue
-        btn = Button(
-            name=name,
-            label=first_param(block, "p_button_static_id") or first_param(block, "p_button_name"),
-            action=first_param(block, "p_button_action"),
-            target=first_param(block, "p_button_redirect_url") or first_param(block, "p_button_execute_validations"),
-            page_id=page_id,
-        )
-        (pm.get(page_id) or add_orphan_page(pages, page_id)).buttons.append(btn)
-
-    # Regions are create_page_plug in APEX exports.
-    for block in extract_blocks(sql_text, "create_page_plug"):
-        page_id = first_param(block, "p_page_id")
-        name = first_param(block, "p_plug_name")
-        if not name:
-            continue
-        reg = Region(
-            name=name,
-            template=first_param(block, "p_plug_template"),
-            source_type=first_param(block, "p_plug_source_type"),
-            source=first_param(block, "p_plug_source"),
-            region_type=first_param(block, "p_plug_display_point"),
-            page_id=page_id,
-        )
-        (pm.get(page_id) or add_orphan_page(pages, page_id)).regions.append(reg)
-
-    for block in extract_blocks(sql_text, "create_page_process"):
-        page_id = first_param(block, "p_page_id")
-        name = first_param(block, "p_process_name")
-        if not name:
-            continue
-        proc = Process(
-            name=name,
-            process_type=first_param(block, "p_process_type"),
-            point=first_param(block, "p_process_point"),
-            source=first_param(block, "p_process_sql_clob") or first_param(block, "p_process_source") or first_param(block, "p_process"),
-            condition=first_param(block, "p_process_when") or first_param(block, "p_process_condition"),
-            page_id=page_id,
-        )
-        (pm.get(page_id) or add_orphan_page(pages, page_id)).processes.append(proc)
-
-    for block in extract_blocks(sql_text, "create_page_validation"):
-        page_id = first_param(block, "p_page_id")
-        name = first_param(block, "p_validation_name")
-        if not name:
-            continue
-        val = Validation(
-            name=name,
-            validation_type=first_param(block, "p_validation_type"),
-            item=first_param(block, "p_associated_item"),
-            error_message=first_param(block, "p_error_message"),
-            condition=first_param(block, "p_validation_condition") or first_param(block, "p_when_button_pressed"),
-            page_id=page_id,
-        )
-        (pm.get(page_id) or add_orphan_page(pages, page_id)).validations.append(val)
-
-    for block in extract_blocks(sql_text, "create_page_da_event"):
-        page_id = first_param(block, "p_page_id")
-        name = first_param(block, "p_name")
-        if not name:
-            continue
-        da = DynamicAction(
-            name=name,
-            event=first_param(block, "p_bind_event_type"),
-            when_element=first_param(block, "p_triggering_element") or first_param(block, "p_triggering_element_type"),
-            condition=first_param(block, "p_condition_element") or first_param(block, "p_client_condition_type"),
-            page_id=page_id,
-        )
-        (pm.get(page_id) or add_orphan_page(pages, page_id)).dynamic_actions.append(da)
+        depth = 0
+        in_quote = False
+        i = open_pos
+        while i < len(sql):
+            ch = sql[i]
+            nxt = sql[i + 1] if i + 1 < len(sql) else ""
+            if ch == "'":
+                if in_quote and nxt == "'":
+                    i += 2
+                    continue
+                in_quote = not in_quote
+            elif not in_quote:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        calls.append((api_name.lower(), sql[open_pos + 1:i], current_page))
+                        break
+            i += 1
+    return calls
 
 
-def extract_authentication(sql_text: str) -> List[Dict[str, str]]:
-    rows = []
-    for block in extract_blocks(sql_text, "create_authentication"):
-        rows.append({
-            "name": first_param(block, "p_name") or first_param(block, "p_scheme_name"),
-            "type": first_param(block, "p_scheme_type") or first_param(block, "p_authentication_function"),
-            "invalid_session": first_param(block, "p_invalid_session_type"),
-        })
-    # older exports sometimes use create_authentication_scheme
-    for block in extract_blocks(sql_text, "create_authentication_scheme"):
-        rows.append({
-            "name": first_param(block, "p_name") or first_param(block, "p_scheme_name"),
-            "type": first_param(block, "p_scheme_type") or first_param(block, "p_authentication_function"),
-            "invalid_session": first_param(block, "p_invalid_session_type"),
-        })
-    return [r for r in rows if any(r.values())]
+def calls_by_name(calls: List[Tuple[str, str, str]], name: str) -> List[Tuple[str, str]]:
+    return [(args, page_ctx) for api, args, page_ctx in calls if api.lower() == name.lower()]
 
 
-def extract_authorization(sql_text: str) -> List[Dict[str, str]]:
-    rows = []
-    for block in extract_blocks(sql_text, "create_security_scheme"):
-        rows.append({
-            "name": first_param(block, "p_name"),
-            "scheme_type": first_param(block, "p_scheme_type"),
-            "error_message": first_param(block, "p_error_message"),
-            "condition": first_param(block, "p_caching"),
-        })
-    return [r for r in rows if any(r.values())]
-
-
-def extract_lists_and_lovs(sql_text: str) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-    lists = []
-    for block in extract_blocks(sql_text, "create_list"):
-        lists.append({"name": first_param(block, "p_name"), "status": first_param(block, "p_list_status")})
-    lovs = []
-    for block in extract_blocks(sql_text, "create_list_of_values"):
-        lovs.append({"name": first_param(block, "p_lov_name") or first_param(block, "p_name"), "query": first_param(block, "p_lov_query")})
-    for block in extract_blocks(sql_text, "create_named_lov"):
-        lovs.append({"name": first_param(block, "p_name") or first_param(block, "p_lov_name"), "query": first_param(block, "p_lov_query")})
-    return lists, lovs
-
-
-def split_columns(definition: str) -> List[str]:
-    parts: List[str] = []
-    buf: List[str] = []
-    depth = 0
-    in_quote = False
-    i = 0
-    while i < len(definition):
-        ch = definition[i]
-        nxt = definition[i + 1] if i + 1 < len(definition) else ""
-        if ch == "'":
-            if in_quote and nxt == "'":
-                buf.append(ch)
-                buf.append(nxt)
-                i += 2
-                continue
-            in_quote = not in_quote
-        elif not in_quote:
-            if ch == "(":
-                depth += 1
-            elif ch == ")" and depth > 0:
-                depth -= 1
-            elif ch == "," and depth == 0:
-                part = "".join(buf).strip()
-                if part:
-                    parts.append(part)
-                buf = []
-                i += 1
-                continue
-        buf.append(ch)
-        i += 1
-    part = "".join(buf).strip()
-    if part:
-        parts.append(part)
-    return parts
-
-
-def extract_database(sql_text: str) -> Dict[str, Any]:
-    tables: Dict[str, DbTable] = {}
-
-    for m in re.finditer(r"\bcreate\s+table\s+([\w.$#]+)\s*\((.*?)\)\s*;", sql_text, flags=re.IGNORECASE | re.DOTALL):
-        table_name = m.group(1).upper()
-        body = m.group(2)
-        table = tables.setdefault(table_name, DbTable(name=table_name))
-        for part in split_columns(body):
-            p = clean_inline(part, max_len=900)
-            if not p:
-                continue
-            if re.match(r"^(constraint|primary\s+key|foreign\s+key|unique|check)\b", p, flags=re.IGNORECASE):
-                table.constraints.append(p)
-                continue
-            col_match = re.match(r"^([\w$#]+)\s+(.+)$", p, flags=re.IGNORECASE | re.DOTALL)
-            if col_match:
-                col_name = col_match.group(1).upper()
-                rest = clean_inline(col_match.group(2), max_len=500)
-                nullable = "No" if re.search(r"\bnot\s+null\b", rest, flags=re.IGNORECASE) else "Yes/Unknown"
-                table.columns.append({"column": col_name, "definition": rest, "nullable": nullable})
-
-    for m in re.finditer(r"\balter\s+table\s+([\w.$#]+)\s+add\s+(.*?);", sql_text, flags=re.IGNORECASE | re.DOTALL):
-        table_name = m.group(1).upper()
-        table = tables.setdefault(table_name, DbTable(name=table_name))
-        table.constraints.append(clean_inline(m.group(2), max_len=900))
-
-    indexes = []
-    for m in re.finditer(r"\bcreate\s+(unique\s+)?index\s+([\w.$#]+)\s+on\s+([\w.$#]+)\s*\((.*?)\)\s*;", sql_text, flags=re.IGNORECASE | re.DOTALL):
-        unique_flag = "UNIQUE" if m.group(1) else "NON-UNIQUE"
-        index_name = m.group(2).upper()
-        table_name = m.group(3).upper()
-        cols = clean_inline(m.group(4), max_len=500)
-        idx = f"{index_name} ({unique_flag}) on {table_name}({cols})"
-        indexes.append({"index": index_name, "table": table_name, "columns": cols, "type": unique_flag})
-        tables.setdefault(table_name, DbTable(name=table_name)).indexes.append(idx)
-
-    views = regex_find(r"\bcreate\s+(?:or\s+replace\s+)?view\s+([\w.$#]+)", sql_text, 200)
-    sequences = regex_find(r"\bcreate\s+sequence\s+([\w.$#]+)", sql_text, 200)
-    triggers = regex_find(r"\bcreate\s+(?:or\s+replace\s+)?trigger\s+([\w.$#]+)", sql_text, 200)
-    packages = regex_find(r"\bcreate\s+(?:or\s+replace\s+)?package(?:\s+body)?\s+([\w.$#]+)", sql_text, 200)
-    procedures = regex_find(r"\bcreate\s+(?:or\s+replace\s+)?procedure\s+([\w.$#]+)", sql_text, 200)
-    functions = regex_find(r"\bcreate\s+(?:or\s+replace\s+)?function\s+([\w.$#]+)", sql_text, 200)
-
-    relationships = []
-    fk_patterns = [
-        r"constraint\s+([\w$#]+)\s+foreign\s+key\s*\((.*?)\)\s+references\s+([\w.$#]+)\s*\((.*?)\)",
-        r"foreign\s+key\s*\((.*?)\)\s+references\s+([\w.$#]+)\s*\((.*?)\)",
+def param(args: str, name: str, max_len: int = 1000) -> str:
+    # Quoted values, q-quoted values, nvl(...,'value'), ids/numbers/constants, and wwv_flow_string.join content.
+    n = re.escape(name)
+    # Special handling for wwv_flow_string.join(wwv_flow_t_varchar2('line1','line2')) must run before constant matching.
+    m = re.search(rf"{n}\s*=>\s*wwv_flow_string\.join\s*\(\s*wwv_flow_t_varchar2\s*\((.*?)\)\s*\)", args, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        parts = re.findall(r"'((?:''|[^'])*)'", m.group(1), flags=re.DOTALL)
+        return clean("\n".join(p.replace("''", "'") for p in parts), max_len=max_len)
+    patterns = [
+        rf"{n}\s*=>\s*q'\[(.*?)\]'",
+        rf"{n}\s*=>\s*q'\{{(.*?)\}}'",
+        rf"{n}\s*=>\s*nvl\([^,]+,\s*'((?:''|[^'])*)'\)",
+        rf"{n}\s*=>\s*'((?:''|[^'])*)'",
+        rf"{n}\s*=>\s*wwv_flow_(?:api|imp)\.id\((\d+)\)",
+        rf"{n}\s*=>\s*(\d+)",
+        rf"{n}\s*=>\s*([A-Z][A-Z0-9_\.]+)",
     ]
-    for pat in fk_patterns:
-        for m in re.finditer(pat, sql_text, flags=re.IGNORECASE | re.DOTALL):
-            if len(m.groups()) == 4:
-                relationships.append({"constraint": clean_inline(m.group(1)), "columns": clean_inline(m.group(2)), "references_table": m.group(3).upper(), "references_columns": clean_inline(m.group(4))})
-            else:
-                relationships.append({"constraint": "", "columns": clean_inline(m.group(1)), "references_table": m.group(2).upper(), "references_columns": clean_inline(m.group(3))})
-
-    return {
-        "tables": [asdict(t) for t in sorted(tables.values(), key=lambda x: x.name)],
-        "indexes": indexes,
-        "relationships": relationships,
-        "views": views,
-        "sequences": sequences,
-        "triggers": triggers,
-        "packages": packages,
-        "procedures": procedures,
-        "functions": functions,
-    }
-
-
-def extract_apis(sql_text: str) -> List[ApiEndpoint]:
-    endpoints: List[ApiEndpoint] = []
-
-    # ORDS modern syntax
-    modules: Dict[str, str] = {}
-    for m in re.finditer(r"ords\.define_module\s*\((.*?)\);", sql_text, flags=re.IGNORECASE | re.DOTALL):
-        block = m.group(1)
-        name = first_param(block, "p_module_name")
-        base = first_param(block, "p_base_path")
-        if name or base:
-            modules[name or base] = base
-
-    templates: List[Tuple[str, str]] = []
-    for m in re.finditer(r"ords\.define_template\s*\((.*?)\);", sql_text, flags=re.IGNORECASE | re.DOTALL):
-        block = m.group(1)
-        module = first_param(block, "p_module_name")
-        pattern = first_param(block, "p_pattern")
-        templates.append((module, pattern))
-
-    for m in re.finditer(r"ords\.define_handler\s*\((.*?)\);", sql_text, flags=re.IGNORECASE | re.DOTALL):
-        block = m.group(1)
-        module = first_param(block, "p_module_name")
-        pattern = first_param(block, "p_pattern")
-        method = first_param(block, "p_method") or "GET"
-        source = first_param(block, "p_source")
-        base = modules.get(module, "")
-        path = "/".join(x.strip("/") for x in [base, pattern] if x)
-        endpoints.append(ApiEndpoint(method=method.upper(), path="/" + path if path and not path.startswith("/") else path, source=source, module=module))
-
-    # APEX/ORDS export style blocks, best effort.
-    for api_name in ["create_restful_module", "create_restful_template", "create_restful_handler"]:
-        for block in extract_blocks(sql_text, api_name):
-            method = first_param(block, "p_method") or first_param(block, "p_http_method") or "GET"
-            path = first_param(block, "p_uri_template") or first_param(block, "p_base_path") or first_param(block, "p_pattern") or first_param(block, "p_template")
-            source = first_param(block, "p_source") or first_param(block, "p_source_clob")
-            module = first_param(block, "p_module_name") or first_param(block, "p_name")
-            if path or source or module:
-                endpoints.append(ApiEndpoint(method=method.upper(), path=path or module, source=source, module=module))
-
-    # Remove duplicates.
-    seen = set()
-    deduped: List[ApiEndpoint] = []
-    for ep in endpoints:
-        key = (ep.method.upper(), ep.path.lower(), ep.module.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(ep)
-    return deduped
-
-
-def extract_app_metadata(sql_text: str) -> Dict[str, Any]:
-    app_id = regex_find(r"p_application_id\s*=>\s*'?([0-9]+)'?", sql_text, 5)
-    app_name = regex_find(r"p_name\s*=>\s*'([^']+)'", sql_text, 20)
-    alias = regex_find(r"p_application_alias\s*=>\s*'([^']+)'", sql_text, 5)
-    return {
-        "application_id": app_id[0] if app_id else "",
-        "application_name_candidates": app_name[:10],
-        "application_alias": alias[0] if alias else "",
-    }
-
-
-def build_metadata(sql_text: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    pages = extract_pages(sql_text)
-    extract_page_components(sql_text, pages)
-    pages.sort(key=lambda p: int(p.page_id) if p.page_id.isdigit() else 999999)
-    lists, lovs = extract_lists_and_lovs(sql_text)
-    metadata = {
-        "generated_at_utc": now_utc_iso(),
-        "source_sql_file": str(APEX_SQL_FILE),
-        "source_sql_file_name": APEX_SQL_FILE.name,
-        "app": extract_app_metadata(sql_text),
-        "pages": [asdict(p) for p in pages],
-        "database": extract_database(sql_text),
-        "apis": [asdict(ep) for ep in extract_apis(sql_text)],
-        "authentication_schemes": extract_authentication(sql_text),
-        "authorization_schemes": extract_authorization(sql_text),
-        "lists": lists,
-        "lovs": lovs,
-        "config_summary": {
-            "purpose": config.get("application", {}).get("purpose", ""),
-            "target_users": config.get("application", {}).get("target_users", []),
-            "third_party_integrations": config.get("architecture", {}).get("third_party_integrations", []),
-        },
-    }
-    return metadata
-
-# =============================================================================
-# Optional OCI polish, never used for technical extraction
-# =============================================================================
-
-def create_oci_client():
-    if oci is None:
-        raise RuntimeError("OCI SDK is not installed. Add 'oci' to requirements.txt.")
-    if not COMPARTMENT_ID or not ENDPOINT or not CHAT_MODEL_ID:
-        raise RuntimeError("OCI GenAI environment variables are incomplete.")
-    if not CONFIG_FILE_PATH or not os.path.exists(CONFIG_FILE_PATH):
-        raise RuntimeError(f"OCI config file not found: {CONFIG_FILE_PATH}")
-    config = oci.config.from_file(CONFIG_FILE_PATH, CONFIG_PROFILE)
-    return oci.generative_ai_inference.GenerativeAiInferenceClient(
-        config=config,
-        service_endpoint=ENDPOINT,
-        retry_strategy=oci.retry.NoneRetryStrategy(),
-        timeout=(10, 120),
-    )
-
-
-def call_oci_short(prompt: str, max_tokens: int = 700) -> str:
-    client = create_oci_client()
-    content = oci.generative_ai_inference.models.TextContent()
-    content.text = prompt
-    message = oci.generative_ai_inference.models.Message()
-    message.role = "USER"
-    message.content = [content]
-    chat_request = oci.generative_ai_inference.models.GenericChatRequest()
-    chat_request.api_format = oci.generative_ai_inference.models.BaseChatRequest.API_FORMAT_GENERIC
-    chat_request.messages = [message]
-    chat_request.max_tokens = max_tokens
-    chat_request.temperature = 0.05
-    chat_request.top_p = 0.7
-    chat_detail = oci.generative_ai_inference.models.ChatDetails()
-    chat_detail.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(model_id=CHAT_MODEL_ID)
-    chat_detail.chat_request = chat_request
-    chat_detail.compartment_id = COMPARTMENT_ID
-    response = client.chat(chat_detail)
-    data = response.data
-    try:
-        return data.chat_response.choices[0].message.content[0].text.strip()
-    except Exception:
-        pass
-    try:
-        return data.chat_response.text.strip()
-    except Exception:
-        pass
+    for pat in patterns:
+        m = re.search(pat, args, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            return clean(m.group(1), max_len=max_len)
     return ""
 
 
-def optional_summary(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
-    fallback = (
-        "This documentation was generated from the deployed APEX SQL export. "
-        "Technical sections are based on extracted pages, regions, items, processes, validations, APIs, database objects, and security schemes."
-    )
-    if not ENABLE_OCI_POLISH:
-        return fallback
-    try:
-        slim = {
-            "app": metadata.get("app", {}),
-            "page_count": len(metadata.get("pages", [])),
-            "table_count": len(metadata.get("database", {}).get("tables", [])),
-            "api_count": len(metadata.get("apis", [])),
-            "purpose": config.get("application", {}).get("purpose", ""),
-            "business_problem": config.get("application", {}).get("business_problem", ""),
-        }
-        prompt = (
-            "Write a concise 4-6 sentence executive summary for an Oracle APEX application. "
-            "Use only the facts in this JSON. Do not invent pages, APIs, tables, or infrastructure. "
-            "Return plain text only.\n\n" + json.dumps(slim, indent=2)
+def page_id_for(args: str, context: str) -> str:
+    return param(args, "p_page_id") or param(args, "p_id") if "create_page" in args[:0] else param(args, "p_page_id") or context
+
+
+def table(headers: List[str], rows: List[List[Any]], empty: str = "Not found in SQL export.") -> str:
+    if not rows:
+        return empty
+    def esc(x: Any) -> str:
+        s = clean(x, 600).replace("|", "\\|")
+        return s if s else "-"
+    out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for row in rows:
+        out.append("| " + " | ".join(esc(c) for c in row) + " |")
+    return "\n".join(out)
+
+
+def bullets(values: List[str], empty: str = "Not found in SQL export.") -> str:
+    vals = unique(values)
+    return "\n".join(f"- {v}" for v in vals) if vals else f"- {empty}"
+
+# -----------------------------------------------------------------------------
+# Extraction
+# -----------------------------------------------------------------------------
+
+def extract_pages(sql: str, calls: List[Tuple[str, str, str]]) -> List[Page]:
+    pages: Dict[str, Page] = {}
+    for args, context in calls_by_name(calls, "create_page"):
+        pid = param(args, "p_id") or param(args, "p_page_id") or context
+        if not pid:
+            continue
+        pages[pid] = Page(
+            page_id=pid,
+            name=param(args, "p_name"),
+            alias=param(args, "p_alias"),
+            title=param(args, "p_step_title") or param(args, "p_page_title") or param(args, "p_name"),
+            page_mode=param(args, "p_page_mode"),
+            public=param(args, "p_page_is_public_y_n"),
+            protection_level=param(args, "p_protection_level"),
+            auth_scheme=param(args, "p_authentication"),
         )
-        text = call_oci_short(prompt)
-        return text if text and "```" not in text else fallback
-    except Exception as exc:
-        print(f"OCI polish skipped: {exc}")
-        return fallback
+    def ensure(pid: str) -> Page:
+        if pid not in pages:
+            pages[pid] = Page(page_id=pid, name=f"Page {pid}", title=f"Page {pid}")
+        return pages[pid]
 
-# =============================================================================
-# Architecture diagram artifacts
-# =============================================================================
+    for args, context in calls_by_name(calls, "create_page_plug"):
+        pid = param(args, "p_page_id") or context
+        if not pid:
+            continue
+        ensure(pid).regions.append(Region(
+            name=param(args, "p_plug_name"),
+            display_point=param(args, "p_plug_display_point"),
+            source_type=param(args, "p_plug_source_type") or param(args, "p_plug_template"),
+            source=param(args, "p_plug_source", MAX_SOURCE_CHARS),
+            template=param(args, "p_plug_template"),
+        ))
 
-def build_mermaid(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
-    api_count = len(metadata.get("apis", []))
-    table_count = len(metadata.get("database", {}).get("tables", []))
-    process_count = sum(len(p.get("processes", [])) for p in metadata.get("pages", []))
-    validation_count = sum(len(p.get("validations", [])) for p in metadata.get("pages", []))
-    integrations = config.get("architecture", {}).get("third_party_integrations", []) or []
-    has_auth = bool(metadata.get("authentication_schemes") or metadata.get("authorization_schemes"))
+    for args, context in calls_by_name(calls, "create_page_item"):
+        pid = param(args, "p_page_id") or context
+        if not pid:
+            continue
+        ensure(pid).items.append(PageItem(
+            name=param(args, "p_name"), prompt=param(args, "p_prompt"), display_as=param(args, "p_display_as"),
+            required=param(args, "p_is_required"), source_type=param(args, "p_source_type"), source=param(args, "p_source", MAX_SOURCE_CHARS),
+            default=param(args, "p_item_default"), lov=param(args, "p_named_lov") or param(args, "p_lov"),
+            max_length=param(args, "p_cMaxlength") or param(args, "p_cmaxlength"), placeholder=param(args, "p_placeholder"),
+            condition=param(args, "p_display_when") or param(args, "p_display_when_type"),
+        ))
 
-    lines = [
+    for args, context in calls_by_name(calls, "create_page_button"):
+        pid = param(args, "p_page_id") or context
+        if not pid:
+            continue
+        ensure(pid).buttons.append(Button(
+            name=param(args, "p_button_name"), label=param(args, "p_button_image_alt") or param(args, "p_button_name"),
+            action=param(args, "p_button_action"), position=param(args, "p_button_position"),
+            target=param(args, "p_button_redirect_url"), execute_validations=param(args, "p_button_execute_validations"),
+        ))
+
+    for args, context in calls_by_name(calls, "create_page_process"):
+        pid = param(args, "p_page_id") or context
+        if not pid:
+            continue
+        ensure(pid).processes.append(Process(
+            name=param(args, "p_process_name"), process_type=param(args, "p_process_type"), point=param(args, "p_process_point"),
+            source=param(args, "p_process_sql_clob", MAX_SOURCE_CHARS) or param(args, "p_process_source", MAX_SOURCE_CHARS) or param(args, "p_process", MAX_SOURCE_CHARS),
+            error_location=param(args, "p_error_display_location"), condition=param(args, "p_process_when") or param(args, "p_process_condition"),
+            when_button=param(args, "p_process_when_button_id"),
+        ))
+
+    for args, context in calls_by_name(calls, "create_page_validation"):
+        pid = param(args, "p_page_id") or context
+        if not pid:
+            continue
+        ensure(pid).validations.append(Validation(
+            name=param(args, "p_validation_name"), validation_type=param(args, "p_validation_type"),
+            associated_item=param(args, "p_associated_item"), error_message=param(args, "p_error_message"),
+            condition=param(args, "p_validation_condition") or param(args, "p_validation_condition_type"), when_button=param(args, "p_when_button_pressed"),
+        ))
+
+    for api in ["create_page_da_event", "create_page_da_action"]:
+        for args, context in calls_by_name(calls, api):
+            pid = param(args, "p_page_id") or context
+            if not pid:
+                continue
+            ensure(pid).dynamic_actions.append(DynamicAction(
+                name=param(args, "p_name") or param(args, "p_event_name"),
+                event=param(args, "p_bind_event_type") or param(args, "p_action"),
+                triggering_element=param(args, "p_triggering_element") or param(args, "p_affected_elements"),
+                condition=param(args, "p_client_condition_type") or param(args, "p_condition_element"),
+            ))
+
+    return sorted(pages.values(), key=lambda p: int(p.page_id) if p.page_id.isdigit() else 999999)
+
+
+def extract_shared(sql: str, calls: List[Tuple[str, str, str]]) -> Dict[str, Any]:
+    auth = []
+    for name in ["create_authentication", "create_authentication_scheme"]:
+        for args, _ in calls_by_name(calls, name):
+            auth.append({"name": param(args, "p_name") or param(args, "p_scheme_name"), "type": param(args, "p_scheme_type"), "invalid_session": param(args, "p_invalid_session_type")})
+    authz = []
+    for name in ["create_authorization_scheme", "create_security_scheme"]:
+        for args, _ in calls_by_name(calls, name):
+            authz.append({"name": param(args, "p_name") or param(args, "p_scheme_name"), "type": param(args, "p_scheme_type") or param(args, "p_authorization_scheme"), "error": param(args, "p_error_message")})
+    lists = []
+    for args, _ in calls_by_name(calls, "create_list"):
+        lists.append({"name": param(args, "p_name"), "status": param(args, "p_list_status")})
+    list_items = []
+    for args, _ in calls_by_name(calls, "create_list_item"):
+        list_items.append({"text": param(args, "p_list_item_link_text"), "target": param(args, "p_list_item_link_target"), "icon": param(args, "p_list_item_icon"), "condition": param(args, "p_list_item_disp_cond_type")})
+    lovs = []
+    for name in ["create_list_of_values", "create_lov"]:
+        for args, _ in calls_by_name(calls, name):
+            lovs.append({"name": param(args, "p_lov_name") or param(args, "p_name"), "query": param(args, "p_lov_query", MAX_SOURCE_CHARS)})
+    rest = []
+    for name in ["create_rest_module", "create_rest_template", "create_rest_handler", "create_restful_service"]:
+        for args, _ in calls_by_name(calls, name):
+            rest.append({"type": name, "name": param(args, "p_name") or param(args, "p_uri_template") or param(args, "p_pattern"), "method": param(args, "p_method"), "source": param(args, "p_source", MAX_SOURCE_CHARS)})
+    return {"authentication": auth, "authorization": authz, "lists": lists, "list_items": list_items, "lovs": lovs, "rest": rest}
+
+
+def extract_database(sql: str) -> Dict[str, Any]:
+    tables = []
+    for m in re.finditer(r"create\s+table\s+([\w.$#]+)\s*\((.*?)\)\s*;", sql, flags=re.IGNORECASE | re.DOTALL):
+        name = m.group(1).upper()
+        body = m.group(2)
+        cols = []
+        for raw in body.splitlines():
+            line = raw.strip().rstrip(',')
+            if not line or line.startswith('--'):
+                continue
+            if re.match(r"(?i)constraint|primary\s+key|foreign\s+key|unique|check", line):
+                continue
+            cm = re.match(r"([\w#$]+)\s+([^,]+)", line)
+            if cm:
+                cols.append({"name": cm.group(1).upper(), "type": clean(cm.group(2), 200)})
+        tables.append({"name": name, "columns": cols})
+    indexes = [{"name": m.group(1).upper(), "table": m.group(2).upper(), "columns": clean(m.group(3), 500)} for m in re.finditer(r"create\s+(?:unique\s+)?index\s+([\w.$#]+)\s+on\s+([\w.$#]+)\s*\((.*?)\)", sql, flags=re.IGNORECASE | re.DOTALL)]
+    fks = []
+    fk_pat = r"constraint\s+([\w#$]+)\s+foreign\s+key\s*\((.*?)\)\s+references\s+([\w.$#]+)\s*\((.*?)\)"
+    for m in re.finditer(fk_pat, sql, flags=re.IGNORECASE | re.DOTALL):
+        fks.append({"name": m.group(1).upper(), "columns": clean(m.group(2)), "ref_table": m.group(3).upper(), "ref_columns": clean(m.group(4))})
+    object_patterns = {
+        "views": r"create\s+(?:or\s+replace\s+)?view\s+([\w.$#]+)",
+        "sequences": r"create\s+sequence\s+([\w.$#]+)",
+        "triggers": r"create\s+(?:or\s+replace\s+)?trigger\s+([\w.$#]+)",
+        "packages": r"create\s+(?:or\s+replace\s+)?package(?:\s+body)?\s+([\w.$#]+)",
+        "procedures": r"create\s+(?:or\s+replace\s+)?procedure\s+([\w.$#]+)",
+        "functions": r"create\s+(?:or\s+replace\s+)?function\s+([\w.$#]+)",
+    }
+    objs = {k: unique([x.upper() for x in re.findall(p, sql, flags=re.IGNORECASE)]) for k, p in object_patterns.items()}
+    referenced_tables = unique([x.upper() for x in re.findall(r"\b(?:from|join|into|update|delete\s+from|merge\s+into)\s+([A-Z][A-Z0-9_$#.]+)", sql, flags=re.IGNORECASE) if x.lower() not in {"dual", "select"}], 200)
+    return {"tables": tables, "indexes": indexes, "foreign_keys": fks, "objects": objs, "referenced_tables": referenced_tables}
+
+# -----------------------------------------------------------------------------
+# Diagram generation - no Mermaid runtime dependency
+# -----------------------------------------------------------------------------
+
+def build_mermaid(metadata: Dict[str, Any]) -> str:
+    # Safe Mermaid syntax: quoted labels and <br/> instead of raw newlines.
+    pages = len(metadata["pages"])
+    tables = len(metadata["database"]["tables"])
+    processes = sum(len(p["processes"]) for p in metadata["pages"])
+    validations = sum(len(p["validations"]) for p in metadata["pages"])
+    return "\n".join([
         "flowchart LR",
-        "  U[End Users] -->|Browser / HTTPS| APEX[Oracle APEX Frontend]",
-        f"  APEX -->|Page submit / AJAX| APP[APEX Runtime + PL/SQL Processes\\nProcesses: {process_count} | Validations: {validation_count}]",
-        f"  APP -->|SQL / PL/SQL| DB[(Oracle Database\\nTables: {table_count})]",
-    ]
-    if has_auth:
-        lines.append("  APEX -->|Authentication / Authorization| SEC[APEX Security Schemes]")
-        lines.append("  SEC --> APP")
-    if api_count:
-        lines.append(f"  API[REST / ORDS APIs\\nEndpoints: {api_count}] --> APP")
-        lines.append("  External[External API Consumers] -->|HTTPS| API")
-    if integrations:
-        for idx, name in enumerate(integrations[:8], start=1):
-            safe = re.sub(r"[^A-Za-z0-9_]", "_", str(name))[:30] or f"Integration{idx}"
-            label = str(name).replace('"', "'")[:60]
-            lines.append(f"  APP -->|Integration| {safe}[{label}]")
-    lines.append("  Jenkins[Jenkins CI/CD] -->|Deploys SQL export| APEX")
-    lines.append("  Jenkins -->|Generates docs artifact| Docs[Documentation Artifacts]")
-    return "\n".join(lines) + "\n"
+        '  U["End Users"] -->|"Browser / HTTPS"| FE["Oracle APEX UI"]',
+        f'  FE -->|"Page submit / AJAX"| RT["APEX Runtime<br/>Pages: {pages}<br/>Processes: {processes}<br/>Validations: {validations}"]',
+        f'  RT -->|"SQL / PL/SQL"| DB[("Oracle Database<br/>Tables in export: {tables}")]',
+        '  J["Jenkins CI/CD"] -->|"Deploy SQL export"| FE',
+        '  J -->|"Generate docs artifacts"| D["Documentation Artifacts"]',
+    ]) + "\n"
 
 
-def build_ascii_architecture(metadata: Dict[str, Any]) -> str:
-    api_line = "External API Consumers -> REST/ORDS APIs -> " if metadata.get("apis") else ""
-    return textwrap.dedent(f"""
-    End Users
-       |
-       | Browser / HTTPS
-       v
-    Oracle APEX Frontend
-       |
-       | Page submit / AJAX / Dynamic actions
-       v
-    APEX Runtime + PL/SQL Processes + Validations
-       |
-       | SQL / PL/SQL
-       v
-    Oracle Database / APEX Parsing Schema
-
-    {api_line}APEX Runtime
-    Jenkins CI/CD -> Deploy SQL export -> APEX Workspace
-    Jenkins CI/CD -> Generate documentation -> Jenkins Artifacts
-    """).strip()
-
-
-def build_svg_diagram(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
-    api_count = len(metadata.get("apis", []))
-    table_count = len(metadata.get("database", {}).get("tables", []))
-    page_count = len(metadata.get("pages", []))
-    process_count = sum(len(p.get("processes", [])) for p in metadata.get("pages", []))
-    has_api = api_count > 0
-    integrations = config.get("architecture", {}).get("third_party_integrations", []) or []
-
-    def rect(x: int, y: int, w: int, h: int, title: str, subtitle: str = "") -> str:
-        title_e = html.escape(title)
-        sub_e = html.escape(subtitle)
-        subtitle_svg = f'<text x="{x + w/2}" y="{y + 58}" text-anchor="middle" font-family="Arial" font-size="13">{sub_e}</text>' if subtitle else ""
-        return f'''
-        <rect x="{x}" y="{y}" width="{w}" height="{h}" rx="14" ry="14" fill="#ffffff" stroke="#444" stroke-width="2"/>
-        <text x="{x + w/2}" y="{y + 34}" text-anchor="middle" font-family="Arial" font-size="16" font-weight="bold">{title_e}</text>
-        {subtitle_svg}
-        '''
-
-    def arrow(x1: int, y1: int, x2: int, y2: int, label: str = "") -> str:
-        label_svg = ""
-        if label:
-            label_svg = f'<text x="{(x1+x2)/2}" y="{(y1+y2)/2 - 8}" text-anchor="middle" font-family="Arial" font-size="12">{html.escape(label)}</text>'
-        return f'''
-        <line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
-        {label_svg}
-        '''
-
-    parts = [f'''<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="620" viewBox="0 0 1100 620">
-      <defs>
-        <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-          <path d="M0,0 L0,6 L9,3 z" fill="#333" />
-        </marker>
-      </defs>
-      <rect x="0" y="0" width="1100" height="620" fill="#f8f8f8"/>
-      <text x="550" y="36" text-anchor="middle" font-family="Arial" font-size="22" font-weight="bold">System Architecture</text>
-    ''']
-    parts.append(rect(70, 90, 190, 90, "End Users", "Browser / HTTPS"))
-    parts.append(rect(330, 90, 220, 90, "Oracle APEX UI", f"Pages: {page_count}"))
-    parts.append(rect(620, 90, 250, 90, "APEX Runtime", f"Processes: {process_count}"))
-    parts.append(rect(620, 270, 250, 90, "Oracle Database", f"Tables: {table_count}"))
-    parts.append(rect(70, 430, 220, 90, "Jenkins CI/CD", "Deployment branch"))
-    parts.append(rect(380, 430, 250, 90, "Documentation", "MD / TXT / ZIP artifacts"))
-    if has_api:
-        parts.append(rect(70, 250, 220, 90, "REST / ORDS APIs", f"Endpoints: {api_count}"))
-        parts.append(arrow(290, 295, 620, 135, "HTTPS"))
-    if integrations:
-        parts.append(rect(910, 90, 150, 90, "Integrations", f"Count: {len(integrations)}"))
-        parts.append(arrow(870, 135, 910, 135, "Calls"))
-    parts.append(arrow(260, 135, 330, 135, "HTTPS"))
-    parts.append(arrow(550, 135, 620, 135, "Submit / AJAX"))
-    parts.append(arrow(745, 180, 745, 270, "SQL / PL/SQL"))
-    parts.append(arrow(180, 430, 430, 180, "Deploy SQL"))
-    parts.append(arrow(290, 475, 380, 475, "Archive"))
-    parts.append('</svg>')
-    return "\n".join(parts)
+def build_svg(metadata: Dict[str, Any]) -> str:
+    pages = len(metadata["pages"])
+    tables = len(metadata["database"]["tables"])
+    processes = sum(len(p["processes"]) for p in metadata["pages"])
+    validations = sum(len(p["validations"]) for p in metadata["pages"])
+    def box(x: int, y: int, w: int, h: int, title: str, lines: List[str]) -> str:
+        text = [f'<text x="{x + 16}" y="{y + 28}" font-size="18" font-weight="700">{html.escape(title)}</text>']
+        yy = y + 56
+        for line in lines:
+            text.append(f'<text x="{x + 16}" y="{yy}" font-size="13">{html.escape(line)}</text>')
+            yy += 20
+        return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="14" fill="#ffffff" stroke="#4b5563" stroke-width="2"/>' + "\n" + "\n".join(text)
+    def arrow(x1: int, y1: int, x2: int, y2: int, label: str) -> str:
+        midx = (x1 + x2) // 2
+        midy = (y1 + y2) // 2 - 8
+        return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#374151" stroke-width="2" marker-end="url(#arrow)"/><text x="{midx}" y="{midy}" text-anchor="middle" font-size="12">{html.escape(label)}</text>'
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="560" viewBox="0 0 1180 560">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#374151" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1180" height="560" fill="#f8fafc"/>
+  <text x="40" y="42" font-size="26" font-weight="700">System Architecture Diagram</text>
+  {box(40, 90, 210, 130, "End Users", ["Browser access", "Authenticated users"])}
+  {box(320, 90, 230, 130, "Oracle APEX UI", [f"Pages: {pages}", "Regions, items, buttons"])}
+  {box(630, 90, 260, 150, "APEX Runtime", [f"Processes: {processes}", f"Validations: {validations}", "Dynamic actions / AJAX"])}
+  {box(970, 90, 180, 150, "Oracle DB", [f"Tables in export: {tables}", "SQL / PL/SQL", "APEX schema"])}
+  {box(320, 330, 230, 120, "Jenkins CI/CD", ["Deployment branch", "Deploy SQL export"])}
+  {box(630, 330, 260, 120, "Docs Artifacts", ["Markdown + TXT", "Metadata JSON", "SVG + HTML + ZIP"])}
+  {arrow(250, 155, 320, 155, "HTTPS")}
+  {arrow(550, 155, 630, 155, "Submit/AJAX")}
+  {arrow(890, 165, 970, 165, "SQL/PLSQL")}
+  {arrow(435, 330, 435, 220, "Deploy")}
+  {arrow(550, 390, 630, 390, "Generate")}
+</svg>'''
+    return svg
 
 
-def build_architecture_html() -> str:
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>System Architecture Diagram</title>
-  <script type="module">
-    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
-    mermaid.initialize({ startOnLoad: true });
-  </script>
-</head>
+def write_diagrams(metadata: Dict[str, Any]) -> None:
+    mmd = build_mermaid(metadata)
+    svg = build_svg(metadata)
+    ARCH_MMD_FILE.write_text(mmd, encoding="utf-8")
+    ARCH_SVG_FILE.write_text(svg, encoding="utf-8")
+    html_doc = f"""<!doctype html>
+<html><head><meta charset=\"utf-8\"><title>System Architecture Diagram</title></head>
 <body>
-  <h1>System Architecture Diagram</h1>
-  <p>This HTML renders the Mermaid diagram generated from the APEX SQL export.</p>
-  <pre class="mermaid">
-%%MERMAID%%
-  </pre>
-</body>
-</html>
-""".replace("%%MERMAID%%", html.escape(ARCH_MMD_FILE.read_text(encoding="utf-8") if ARCH_MMD_FILE.exists() else ""))
+<h1>System Architecture Diagram</h1>
+<p>This file embeds a generated SVG diagram directly, so it does not depend on Mermaid or OCI image output.</p>
+{svg}
+<h2>Mermaid Source</h2>
+<pre>{html.escape(mmd)}</pre>
+</body></html>
+"""
+    ARCH_HTML_FILE.write_text(html_doc, encoding="utf-8")
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Documentation rendering
-# =============================================================================
+# -----------------------------------------------------------------------------
 
-def infer_page_purpose(page: Dict[str, Any]) -> str:
-    title = page.get("title") or f"Page {page.get('page_id', '')}"
-    region_names = [r.get("name", "") for r in page.get("regions", []) if r.get("name")]
-    process_names = [p.get("name", "") for p in page.get("processes", []) if p.get("name")]
+def page_summary(p: Dict[str, Any]) -> str:
+    if p["page_id"] == "0":
+        return "Global Page components apply across the application."
+    if p.get("public") == "Y" or "login" in (p.get("name", "") + p.get("title", "")).lower():
+        return "Public/authentication page used to allow users to access the application."
     bits = []
-    if region_names:
-        bits.append("regions such as " + ", ".join(region_names[:4]))
-    if process_names:
-        bits.append("server-side processes such as " + ", ".join(process_names[:3]))
-    suffix = " and ".join(bits)
-    return f"The {title} page supports the application workflow" + (f" through {suffix}." if suffix else ".")
+    if p["regions"]:
+        bits.append(f"contains {len(p['regions'])} region(s)")
+    if p["items"]:
+        bits.append(f"captures or displays {len(p['items'])} item(s)")
+    if p["processes"]:
+        bits.append(f"runs {len(p['processes'])} backend process(es)")
+    if p["validations"]:
+        bits.append(f"has {len(p['validations'])} validation rule(s)")
+    return "This page " + ", ".join(bits) + "." if bits else "This page is defined in the APEX SQL export."
 
 
-def component_comm_summary(page: Dict[str, Any]) -> str:
-    has_process = bool(page.get("processes"))
-    has_da = bool(page.get("dynamic_actions"))
-    has_region_sql = any(source_tables_from_text(r.get("source", "")) for r in page.get("regions", []))
-    parts = ["The browser renders APEX regions and page items."]
-    if has_da:
-        parts.append("Dynamic actions handle client-side events and may trigger AJAX behavior.")
-    if has_process:
-        parts.append("Page submissions invoke APEX page processes and validations in the backend.")
-    if has_region_sql:
-        parts.append("Region SQL sources communicate with Oracle Database objects to read application data.")
-    return " ".join(parts)
-
-
-def tables_used_by_page(page: Dict[str, Any]) -> List[str]:
-    vals: List[str] = []
-    for group in ["regions", "processes", "items"]:
-        for obj in page.get(group, []):
-            vals.extend(source_tables_from_text(obj.get("source", "")))
-    return unique(vals, limit=50)
-
-
-def render_page_section(page: Dict[str, Any], config: Dict[str, Any], metadata: Dict[str, Any]) -> str:
-    page_id = page.get("page_id", "")
-    title = page.get("title") or f"Page {page_id}"
-    header = f"### Page {page_id}: {title}" if page_id else f"### {title}"
-    screenshot_note = "Screenshot placeholder: capture this page from the deployed APEX workspace and attach it here." if config.get("user_guide", {}).get("include_screenshot_placeholders", True) else "Screenshot placeholder disabled in documentation_config.json."
-
-    item_rows = [[i.get("name"), i.get("label"), i.get("display_as"), i.get("required"), i.get("source_type"), i.get("lov")] for i in page.get("items", [])]
-    button_rows = [[b.get("name"), b.get("label"), b.get("action"), b.get("target")] for b in page.get("buttons", [])]
-    region_rows = [[r.get("name"), r.get("source_type"), r.get("region_type"), truncate_code(r.get("source", ""), 300)] for r in page.get("regions", [])]
-    validation_rows = [[v.get("name"), v.get("validation_type"), v.get("item"), v.get("error_message"), v.get("condition")] for v in page.get("validations", [])]
-    process_rows = [[p.get("name"), p.get("process_type"), p.get("point"), truncate_code(p.get("source", ""), 300)] for p in page.get("processes", [])]
-    da_rows = [[d.get("name"), d.get("event"), d.get("when_element"), d.get("condition")] for d in page.get("dynamic_actions", [])]
-    tables = tables_used_by_page(page)
-
-    nav_steps = []
-    if page.get("alias"):
-        nav_steps.append(f"Open the page using alias `{page.get('alias')}` or through the application navigation menu.")
+def render_page(p: Dict[str, Any], config: Dict[str, Any]) -> str:
+    title = p.get("title") or p.get("name") or f"Page {p['page_id']}"
+    lines = [f"### Page {p['page_id']} - {title}", ""]
+    lines += ["#### Page Overview", "", page_summary(p), ""]
+    lines += ["| Field | Value |", "| --- | --- |",
+              f"| Page ID | {p['page_id']} |", f"| Name | {clean(p.get('name')) or '-'} |", f"| Alias | {clean(p.get('alias')) or '-'} |",
+              f"| Title | {clean(title) or '-'} |", f"| Public Page | {clean(p.get('public')) or 'N/Not specified'} |",
+              f"| Protection Level | {clean(p.get('protection_level')) or '-'} |", ""]
+    lines += ["#### Page Architecture and Communication", "",
+              "- Browser renders this page through Oracle APEX runtime metadata.",
+              "- Page submissions, button clicks, validations, dynamic actions, and AJAX callbacks are handled by APEX runtime.",
+              "- Backend communication is performed using SQL/PLSQL in page processes, region sources, LOVs, and validations.", ""]
+    if config.get("user_guide", {}).get("include_screenshot_placeholders", True):
+        lines += ["#### Screenshot Placeholder", "", f"Add a screenshot for Page {p['page_id']} - {title} here after deployment validation.", ""]
+    lines += ["#### User Guide / Workflow", "", "1. Open the application and navigate to this page.", "2. Review visible regions and instructions.", "3. Enter required page item values."]
+    if p["buttons"]:
+        btns = ", ".join([b.get("label") or b.get("name") for b in p["buttons"] if b.get("label") or b.get("name")])
+        lines.append(f"4. Use available action buttons: {btns}.")
     else:
-        nav_steps.append("Open the page through the application navigation menu or direct APEX page URL.")
-    for r in page.get("regions", [])[:4]:
-        nav_steps.append(f"Review the `{r.get('name')}` region.")
-    for i in page.get("items", [])[:6]:
-        label = i.get("label") or i.get("name")
-        nav_steps.append(f"Enter or review `{label}`.")
-    for b in page.get("buttons", [])[:4]:
-        nav_steps.append(f"Use the `{b.get('name')}` button when the workflow requires it.")
+        lines.append("4. Use page navigation or available controls to continue.")
+    lines += ["5. Confirm success messages or correct validation errors.", ""]
+    lines += ["#### Regions / UI Sections", "", table(["Region", "Display Point", "Source Type", "Source / Query"], [[r["name"], r["display_point"], r["source_type"], r["source"]] for r in p["regions"]]), ""]
+    lines += ["#### Page Items / Fields", "", table(["Item", "Prompt", "Display As", "Required", "Max Length", "Source / Default / LOV"], [[i["name"], i["prompt"], i["display_as"], i["required"], i["max_length"], i["source"] or i["default"] or i["lov"]] for i in p["items"]]), ""]
+    lines += ["#### Buttons / Actions", "", table(["Button", "Label", "Action", "Position", "Target / Validations"], [[b["name"], b["label"], b["action"], b["position"], b["target"] or b["execute_validations"]] for b in p["buttons"]]), ""]
+    lines += ["#### Backend Processes", "", table(["Process", "Type", "Execution Point", "Source / Logic", "Error Location"], [[pr["name"], pr["process_type"], pr["point"], pr["source"], pr["error_location"]] for pr in p["processes"]]), ""]
+    lines += ["#### Validations", "", table(["Validation", "Type", "Associated Item", "Error Message", "Condition"], [[v["name"], v["validation_type"], v["associated_item"], v["error_message"], v["condition"]] for v in p["validations"]]), ""]
+    lines += ["#### Dynamic Actions / Client Behavior", "", table(["Dynamic Action", "Event / Action", "Triggering Element", "Condition"], [[d["name"], d["event"], d["triggering_element"], d["condition"]] for d in p["dynamic_actions"]]), ""]
+    lines += ["#### Page Security Notes", "",
+              f"- Public page flag: {p.get('public') or 'Not specified'}.",
+              f"- Page protection level: {p.get('protection_level') or 'Not specified'}.",
+              "- Confirm that sensitive page items and buttons are protected by proper authorization schemes.", ""]
+    lines += ["#### Page Troubleshooting", "",
+              "- Check required fields and validation messages first.",
+              "- If a submit action fails, review page process errors and APEX debug logs.",
+              "- If data is missing, inspect region SQL/PLSQL sources and referenced database objects.", ""]
+    return "\n".join(lines)
+
+
+def render_docs(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
+    info = metadata["application"]
+    pages = metadata["pages"]
+    db = metadata["database"]
+    shared = metadata["shared"]
+    generated_at = metadata["generated_at_utc"]
+    app_name = info.get("application_name") or "Oracle APEX Application"
+
+    lines: List[str] = []
+    lines += [f"# {app_name} - Application Documentation", "",
+              f"Generated at UTC: {generated_at}  ",
+              f"Source SQL file: {metadata['source_sql_file']}  ",
+              f"Application ID: {info.get('application_id') or 'Not found'}  ",
+              f"Application alias: {info.get('alias') or 'Not found'}  ",
+              f"APEX version/export version: {info.get('version') or 'Not found'}  ", ""]
+    lines += ["## 1. Overview / Introduction", "",
+              "### Purpose of the Application", "", config["application"]["purpose"], "",
+              "### Business Problem It Solves", "", config["application"]["business_problem"], "",
+              "### Target Users", "", bullets(config["application"].get("target_users", []), "No target users configured."), "",
+              "### Key Features", "", bullets(config["application"].get("key_features", []) or [f"APEX application with {len(pages)} page(s) extracted from SQL export", "Generated page-by-page technical documentation", "Architecture, user guide, API, database, and security documentation in one file"]), "",
+              "### Scope", "", config["application"]["scope"], "",
+              "### Limitations", "", bullets(config["application"].get("limitations", [])), "",
+              "### Extracted Application Inventory", "",
+              f"- Pages detected: {len(pages)}",
+              f"- Regions detected: {sum(len(p['regions']) for p in pages)}",
+              f"- Page items detected: {sum(len(p['items']) for p in pages)}",
+              f"- Buttons detected: {sum(len(p['buttons']) for p in pages)}",
+              f"- Page processes detected: {sum(len(p['processes']) for p in pages)}",
+              f"- Validations detected: {sum(len(p['validations']) for p in pages)}",
+              f"- Authentication schemes detected: {len(shared['authentication'])}",
+              f"- Authorization schemes detected: {len(shared['authorization'])}",
+              f"- Navigation/list items detected: {len(shared['list_items'])}", ""]
+    lines += ["## 2. System Architecture", "",
+              "### High-Level Architecture Diagram", "",
+              "The architecture diagram is generated locally as SVG and embedded in the artifact bundle. It does not depend on OCI GenAI image output or Mermaid browser rendering.", "",
+              "Artifacts:", "",
+              "- `documentation/generated/architecture_diagram.svg`",
+              "- `documentation/generated/architecture_diagram.html`",
+              "- `documentation/generated/architecture_diagram.mmd`", "",
+              "Markdown image reference:", "", "![System Architecture Diagram](architecture_diagram.svg)", "",
+              "### Components / Services", "",
+              f"- Frontend: {config['architecture']['frontend']}",
+              f"- Backend: {config['architecture']['backend']}",
+              f"- Database: {config['architecture']['database']}",
+              f"- Cloud / Infrastructure: {config['architecture']['cloud_infrastructure']}",
+              "- Third-party integrations:", bullets(config["architecture"].get("third_party_integrations", [])), "",
+              "### How the System Works Internally", "",
+              "Users access the Oracle APEX frontend in a browser. APEX renders pages, regions, items, buttons, navigation, and shared components from metadata in the SQL export. User actions invoke validations, dynamic actions, page processes, and SQL/PLSQL logic. The APEX runtime communicates with the Oracle Database using the parsing schema and returns rendered pages, notifications, redirects, or API responses.", "",
+              "### How Components Communicate", "",
+              "- Browser to APEX: HTTPS page requests, form submissions, and AJAX calls.",
+              "- APEX UI to APEX runtime: page metadata, validations, processes, dynamic actions, and session state.",
+              "- APEX runtime to database: SQL and PL/SQL in regions, processes, LOVs, and validations.",
+              "- Jenkins to APEX: deployment branch pipeline deploys the SQL export to the configured workspace/schema/app ID.",
+              "- Jenkins to artifacts: documentation generator creates Markdown, TXT, metadata JSON, SVG, HTML, Mermaid, and ZIP outputs.", ""]
+    lines += ["## 3. Page-by-Page Documentation", "", "All detected APEX pages are documented below in this single combined file.", ""]
+    if not pages:
+        lines += ["No pages were detected. This usually means the parser did not recognize the export syntax or the wrong SQL file was passed to `APEX_SQL_FILE`.", ""]
+    for p in pages:
+        lines.append(render_page(p, config))
+    lines += ["## 4. Shared Application Components", "",
+              "### Navigation Lists", "", table(["List", "Status"], [[x["name"], x["status"]] for x in shared["lists"]]), "",
+              "### Navigation/List Items", "", table(["Text", "Target", "Icon", "Condition"], [[x["text"], x["target"], x["icon"], x["condition"]] for x in shared["list_items"]]), "",
+              "### List of Values / LOVs", "", table(["LOV", "Query / Source"], [[x["name"], x["query"]] for x in shared["lovs"]]), ""]
+    lines += ["## 5. User Guide", "",
+              "### Navigation Overview", "", bullets([x["text"] for x in shared["list_items"] if x.get("text") and x.get("text") not in {"---", "&APP_USER."}], "No navigation entries detected."), "",
+              "### General Workflow", "", "1. Open the deployed APEX application URL.", "2. Sign in using an authorized account if the page is not public.", "3. Navigate to the required page from the application menu or direct link.", "4. Complete required fields and review validation messages.", "5. Submit or save using available page buttons.", "6. Confirm success notifications or correct displayed errors.", "",
+              "### Page Workflows", ""]
+    for p in pages:
+        lines += [f"- Page {p['page_id']} - {p.get('title') or p.get('name')}: {page_summary(p)}"]
+    lines += ["", "### FAQs", ""]
+    for faq in config["user_guide"].get("faq", []):
+        lines += [f"Q: {faq.get('question', '')}", "", f"A: {faq.get('answer', '')}", ""]
+    lines += ["### Troubleshooting Tips", "", bullets(config["user_guide"].get("troubleshooting", [])), ""]
+    lines += ["## 6. API Documentation", ""]
+    if shared["rest"] or config.get("manual_api_examples"):
+        lines += ["### Extracted REST/ORDS Endpoints", "", table(["Type", "Name / URI", "Method", "Source"], [[x["type"], x["name"], x["method"], x["source"]] for x in shared["rest"]]), ""]
+    else:
+        lines += ["No REST/ORDS API endpoints were detected in the provided APEX SQL export.", ""]
+    lines += ["### Authentication", "", config["api"]["authentication"], "", "### Error Codes", "", bullets(config["api"].get("error_codes", [])), "", "### Rate Limits", "", config["api"]["rate_limits"], ""]
+    lines += ["## 7. Database Documentation", "",
+              "### Database Overview", "", f"Tables explicitly created in export: {len(db['tables'])}", "", "### Referenced Tables / Objects", "", bullets(db.get("referenced_tables", []), "No table references detected in SQL/PLSQL sources."), "",
+              "### Tables and Data Dictionary", ""]
+    if db["tables"]:
+        for t in db["tables"]:
+            lines += [f"#### Table {t['name']}", "", table(["Column", "Type / Definition"], [[c["name"], c["type"]] for c in t["columns"]]), ""]
+    else:
+        lines += ["No CREATE TABLE statements were found in the APEX export. This is normal when tables are managed separately from the APEX application export.", ""]
+    lines += ["### ER Diagram / Relationships", "", table(["Constraint", "Columns", "Referenced Table", "Referenced Columns"], [[x["name"], x["columns"], x["ref_table"], x["ref_columns"]] for x in db["foreign_keys"]]), "",
+              "### Indexing Strategy", "", table(["Index", "Table", "Columns"], [[x["name"], x["table"], x["columns"]] for x in db["indexes"]]), "",
+              "### Stored Procedures, Packages, Triggers, and Supporting Objects", ""]
+    for k, vals in db["objects"].items():
+        lines += [f"#### {k.title()}", "", bullets(vals, f"No {k} found in SQL export."), ""]
+    if config.get("manual_database_notes"):
+        lines += ["### Manual Database Notes", "", bullets(config["manual_database_notes"]), ""]
+    lines += ["## 8. Security Documentation", "",
+              "### Authentication Method", "", config["security"]["authentication_method"], "", table(["Scheme", "Type", "Invalid Session Handling"], [[x["name"], x["type"], x["invalid_session"]] for x in shared["authentication"]]), "",
+              "### Authorization Roles and Schemes", "", "Configured roles:", bullets(config["security"].get("authorization_roles", []), "No manual roles configured in documentation_config.json."), "", "Extracted authorization schemes:", "", table(["Scheme", "Type", "Error Message"], [[x["name"], x["type"], x["error"]] for x in shared["authorization"]]), "",
+              "### Encryption Details", "", config["security"]["encryption_details"], "",
+              "### Audit Logging", "", config["security"]["audit_logging"], "",
+              "### Security Best Practices", "", bullets(config["security"].get("best_practices", [])), ""]
+    if config.get("manual_security_notes"):
+        lines += ["### Manual Security Notes", "", bullets(config["manual_security_notes"]), ""]
+    return "\n".join(lines).replace("\n\n\n\n", "\n\n")
+
+
+def markdown_to_text(md: str) -> str:
+    txt = md
+    txt = re.sub(r"^#{1,6}\s*", "", txt, flags=re.MULTILINE)
+    txt = txt.replace("`", "")
+    txt = txt.replace("![System Architecture Diagram](architecture_diagram.svg)", "See architecture_diagram.svg artifact.")
+    return txt
 
-    return f"""
-{header}
-
-#### Page Overview
-- **Purpose:** {infer_page_purpose(page)}
-- **Alias:** {page.get('alias') or 'Not found in SQL export.'}
-- **Page mode:** {page.get('page_mode') or 'Not found in SQL export.'}
-- **Authentication setting:** {page.get('auth_required') or 'Not found in SQL export.'}
-- **Protection level:** {page.get('protection_level') or 'Not found in SQL export.'}
-
-#### Page Architecture and Internal Communication
-{component_comm_summary(page)}
-
-- **Frontend components:** {len(page.get('regions', []))} regions, {len(page.get('items', []))} page items, {len(page.get('buttons', []))} buttons.
-- **Backend components:** {len(page.get('processes', []))} page processes and {len(page.get('validations', []))} validations.
-- **Database objects referenced by this page:** {', '.join(tables) if tables else 'Not found from SQL sources on this page.'}
-
-#### User Guide for This Page
-{screenshot_note}
-
-{chr(10).join(f'{idx + 1}. {step}' for idx, step in enumerate(nav_steps))}
-
-#### UI Components
-
-**Regions**
-
-{md_table(['Region', 'Source type', 'Display point/type', 'Source excerpt'], region_rows)}
-
-**Page Items**
-
-{md_table(['Item', 'Label', 'Display type', 'Required', 'Source type', 'LOV'], item_rows)}
-
-**Buttons / Actions**
-
-{md_table(['Button', 'Label/static id', 'Action', 'Target / validation flag'], button_rows)}
-
-#### Backend Logic
-
-**Processes**
-
-{md_table(['Process', 'Type', 'Execution point', 'Source excerpt'], process_rows)}
-
-**Validations**
-
-{md_table(['Validation', 'Type', 'Associated item', 'Error message', 'Condition'], validation_rows)}
-
-**Dynamic Actions**
-
-{md_table(['Dynamic action', 'Event', 'Triggering element', 'Condition'], da_rows)}
-
-#### Page-Level Security Notes
-- Confirm this page is protected by the expected authentication and authorization scheme before production use.
-- Confirm sensitive buttons and processes cannot be invoked directly without authorization.
-- Validate all item input on the server side, especially items marked as required or used in SQL/PLSQL processes.
-
-#### Page Troubleshooting
-- If the page fails to load, check APEX runtime errors, page authorization, and referenced SQL sources.
-- If save/submit fails, review validations and page process errors listed above.
-- If data does not appear, verify the database tables/views referenced by the page regions and processes.
-""".strip()
-
-
-def render_api_docs(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
-    endpoints = metadata.get("apis", [])
-    api_config = config.get("api", {})
-    exposes = api_config.get("exposes_apis", "auto")
-    if exposes == "no" or (exposes == "auto" and not endpoints and not config.get("manual_api_examples")):
-        return """
-## 6. API Documentation
-
-No REST/ORDS API endpoints were detected in the provided APEX SQL export.
-
-If the application exposes APIs outside the APEX export, maintain the endpoint list in `documentation/documentation_config.json` under `manual_api_examples`.
-
-### API Checklist
-- **Endpoints:** Not found in SQL export.
-- **Request/response examples:** Not found in SQL export.
-- **Authentication:** Not found in SQL export; update manually if external APIs exist.
-- **Error codes:** Use standard HTTP and application-specific errors if APIs are later added.
-- **Rate limits:** Not found in SQL export; define based on ORDS/API gateway/service configuration.
-""".strip()
-
-    rows = [[ep.get("method"), ep.get("path"), ep.get("module"), truncate_code(ep.get("source", ""), 250)] for ep in endpoints]
-    examples = []
-    base = api_config.get("base_url", "").rstrip("/")
-    for ep in endpoints[:20]:
-        method = ep.get("method", "GET") or "GET"
-        path = ep.get("path", "/") or "/"
-        url = f"{base}{path}" if base else path
-        body = "" if method.upper() in {"GET", "DELETE"} else "\nContent-Type: application/json\n\n{\n  \"exampleField\": \"exampleValue\"\n}"
-        examples.append(f"""
-#### `{method.upper()} {path}`
-
-**Request example**
-
-```http
-{method.upper()} {url} HTTP/1.1
-Authorization: Bearer <token>{body}
-```
-
-**Success response example**
-
-```json
-{{
-  "status": "success",
-  "data": {{}}
-}}
-```
-
-**Error response example**
-
-```json
-{{
-  "status": "error",
-  "message": "Request could not be processed"
-}}
-```
-""".strip())
-
-    manual = config.get("manual_api_examples", []) or []
-    manual_text = ""
-    if manual:
-        manual_text = "\n\n### Manually Configured API Notes\n" + text_list([json.dumps(x, ensure_ascii=False) for x in manual], limit=50)
-
-    return f"""
-## 6. API Documentation
-
-### API Summary
-
-{md_table(['Method', 'Endpoint/path', 'Module', 'Source excerpt'], rows)}
-
-### Authentication
-{api_config.get('authentication') or 'Update authentication details in documentation_config.json.'}
-
-### Rate Limits
-{api_config.get('rate_limits') or 'Not defined in SQL export.'}
-
-### Error Codes
-{text_list(api_config.get('error_codes', []), none_text='No API error codes configured.')}
-
-### Request / Response Examples
-
-{chr(10).join(examples) if examples else 'No endpoint examples could be generated.'}
-{manual_text}
-""".strip()
-
-
-def render_database_docs(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
-    db = metadata.get("database", {})
-    tables = db.get("tables", [])
-    overview_rows = [[t.get("name"), len(t.get("columns", [])), len(t.get("constraints", [])), len(t.get("indexes", []))] for t in tables]
-
-    table_sections = []
-    for t in tables:
-        col_rows = [[c.get("column"), c.get("definition"), c.get("nullable")] for c in t.get("columns", [])]
-        table_sections.append(f"""
-### Table `{t.get('name')}`
-
-**Data Dictionary**
-
-{md_table(['Column', 'Definition', 'Nullable'], col_rows)}
-
-**Constraints**
-{text_list(t.get('constraints', []), none_text='No constraints found for this table.')}
-
-**Indexes**
-{text_list(t.get('indexes', []), none_text='No indexes found for this table.')}
-""".strip())
-
-    relationship_rows = [[r.get("constraint"), r.get("columns"), r.get("references_table"), r.get("references_columns")] for r in db.get("relationships", [])]
-    object_lines = []
-    for key, label in [("views", "Views"), ("sequences", "Sequences"), ("triggers", "Triggers"), ("packages", "Packages"), ("procedures", "Procedures"), ("functions", "Functions")]:
-        vals = db.get(key, [])
-        object_lines.append(f"### {label}\n{text_list(vals, none_text=f'No {label.lower()} found in SQL export.')}")
-
-    manual_notes = config.get("manual_database_notes", []) or []
-    manual_text = "\n\n### Manual Database Notes\n" + text_list(manual_notes, limit=100) if manual_notes else ""
-
-    er_note = "The relationship table below is the ER diagram source. The generated architecture diagram is included separately as SVG/Mermaid."
-
-    return f"""
-## 7. Database Documentation
-
-### Database Overview
-
-{md_table(['Table', 'Columns', 'Constraints', 'Indexes'], overview_rows)}
-
-### ER Diagram / Relationships
-{er_note}
-
-{md_table(['Constraint', 'Local columns', 'References table', 'References columns'], relationship_rows)}
-
-### Tables and Data Dictionary
-
-{chr(10).join(table_sections) if table_sections else 'No CREATE TABLE statements were found in the SQL export. If tables are managed outside the APEX export, document them in documentation_config.json.'}
-
-### Stored Procedures, Packages, Triggers, and Supporting Objects
-
-{chr(10).join(object_lines)}
-
-### Indexing Strategy
-- Indexes extracted from the SQL export are listed under each table and in the overview above.
-- Review query-heavy APEX regions and page processes to ensure filtering, joins, and lookup columns are indexed.
-- Review foreign key columns for indexing when they participate in joins or cascading operations.
-{manual_text}
-""".strip()
-
-
-def render_security_docs(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
-    sec = config.get("security", {})
-    auth_rows = [[a.get("name"), a.get("type"), a.get("invalid_session")] for a in metadata.get("authentication_schemes", [])]
-    authz_rows = [[a.get("name"), a.get("scheme_type"), a.get("error_message"), a.get("condition")] for a in metadata.get("authorization_schemes", [])]
-    manual_notes = config.get("manual_security_notes", []) or []
-    roles = sec.get("authorization_roles", []) or []
-
-    return f"""
-## 8. Security Documentation
-
-### Authentication Method
-
-Configured description: {sec.get('authentication_method') or 'Update in documentation_config.json.'}
-
-{md_table(['Scheme', 'Type', 'Invalid session behavior'], auth_rows)}
-
-### Authorization Roles and Schemes
-
-Configured roles:
-{text_list(roles, none_text='No manual roles configured in documentation_config.json.')}
-
-Extracted APEX authorization schemes:
-
-{md_table(['Scheme', 'Type', 'Error message', 'Caching/condition'], authz_rows)}
-
-### Encryption Details
-{sec.get('encryption_details') or 'Update encryption details in documentation_config.json.'}
-
-### Audit Logging
-{sec.get('audit_logging') or 'Update audit logging details in documentation_config.json.'}
-
-### Security Best Practices
-{text_list(sec.get('best_practices', []), none_text='No security best practices configured.')}
-
-### Manual Security Notes
-{text_list(manual_notes, none_text='No manual security notes configured.')}
-""".strip()
-
-
-def render_user_guide(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
-    pages = metadata.get("pages", [])
-    page_rows = [[p.get("page_id"), p.get("title"), p.get("alias"), len(p.get("items", [])), len(p.get("buttons", [])), len(p.get("regions", []))] for p in pages]
-    faq = config.get("user_guide", {}).get("faq", []) or []
-    troubleshooting = config.get("user_guide", {}).get("troubleshooting", []) or []
-    faq_text = "\n".join(f"**Q: {f.get('question', '')}**\n\nA: {f.get('answer', '')}" for f in faq)
-    return f"""
-## 5. User Guide
-
-### Navigation Overview
-
-{md_table(['Page ID', 'Page title', 'Alias', 'Items', 'Buttons', 'Regions'], page_rows)}
-
-### General Workflow
-1. Open the deployed APEX application URL.
-2. Sign in using an authorized account.
-3. Navigate to the required page from the application menu or direct page link.
-4. Complete required fields and review validation messages.
-5. Submit or save using the available page buttons.
-6. Confirm success notifications or review displayed errors.
-
-### Screenshots
-Screenshot placeholders are included in each page section. For final user-facing documentation, capture screenshots from the deployed workspace and add them near the relevant page workflow.
-
-### FAQs
-{faq_text if faq_text else 'No FAQs configured.'}
-
-### Troubleshooting Tips
-{text_list(troubleshooting, none_text='No troubleshooting tips configured.')}
-""".strip()
-
-
-def render_document(metadata: Dict[str, Any], config: Dict[str, Any]) -> str:
-    app = metadata.get("app", {})
-    app_cfg = config.get("application", {})
-    arch_cfg = config.get("architecture", {})
-    pages = metadata.get("pages", [])
-    app_name = app_cfg.get("name") or (app.get("application_name_candidates") or ["Oracle APEX Application"])[0]
-    summary = optional_summary(metadata, config)
-    mermaid = build_mermaid(metadata, config)
-    ascii_arch = build_ascii_architecture(metadata)
-
-    overview = f"""
-# {app_name} - Application Documentation
-
-Generated at UTC: `{metadata.get('generated_at_utc')}`  
-Source SQL file: `{metadata.get('source_sql_file_name')}`  
-Application ID: `{app.get('application_id') or 'Not found in SQL export.'}`  
-Application alias: `{app.get('application_alias') or 'Not found in SQL export.'}`
-
-## 1. Overview / Introduction
-
-### Purpose of the Application
-{app_cfg.get('purpose')}
-
-### Business Problem It Solves
-{app_cfg.get('business_problem')}
-
-### Target Users
-{text_list(app_cfg.get('target_users', []), none_text='No target users configured.')}
-
-### Key Features
-{text_list(app_cfg.get('key_features', []), none_text='Key features were not configured manually. Page-level features are documented below from the SQL export.')}
-
-### Scope
-{app_cfg.get('scope')}
-
-### Limitations
-{text_list(app_cfg.get('limitations', []), none_text='No limitations configured.')}
-
-### Generated Summary
-{summary}
-
-### Extracted Application Inventory
-- Pages: {len(pages)}
-- Tables: {len(metadata.get('database', {}).get('tables', []))}
-- REST/ORDS API endpoints: {len(metadata.get('apis', []))}
-- Authentication schemes: {len(metadata.get('authentication_schemes', []))}
-- Authorization schemes: {len(metadata.get('authorization_schemes', []))}
-- Lists: {len(metadata.get('lists', []))}
-- LOVs: {len(metadata.get('lovs', []))}
-""".strip()
-
-    architecture = f"""
-## 2. System Architecture
-
-### High-Level Architecture Diagram
-
-The repository generates a real SVG diagram artifact without relying on OCI GenAI image output:
-
-- `documentation/generated/architecture_diagram.svg`
-- `documentation/generated/architecture_diagram.mmd`
-- `documentation/generated/architecture_diagram.html`
-
-Markdown renderers that support Mermaid can render this directly:
-
-```mermaid
-{mermaid.strip()}
-```
-
-Plain-text fallback diagram:
-
-```text
-{ascii_arch}
-```
-
-### Components / Services
-- **Frontend:** {arch_cfg.get('frontend')}
-- **Backend:** {arch_cfg.get('backend')}
-- **Database:** {arch_cfg.get('database')}
-- **Cloud / Infrastructure:** {arch_cfg.get('cloud_infrastructure')}
-- **Third-party integrations:** {', '.join(map(str, arch_cfg.get('third_party_integrations', []) or [])) or 'Not configured.'}
-
-### How the System Works Internally
-Users access the Oracle APEX frontend through a browser. APEX renders pages, regions, forms, reports, and navigation based on metadata in the SQL export. User actions invoke page validations, dynamic actions, AJAX calls, and page processes. Backend logic executes SQL/PLSQL against the Oracle Database and returns rendered pages, notifications, or API responses.
-
-### How Components Communicate
-- Browser to APEX: HTTPS page requests, form submissions, and AJAX calls.
-- APEX UI to APEX runtime: page metadata, validations, dynamic actions, and process execution.
-- APEX runtime to database: SQL and PL/SQL from regions, items, validations, LOVs, and page processes.
-- CI/CD to APEX: Jenkins deploys the SQL export to the configured workspace/schema/application ID.
-- CI/CD to documentation artifacts: Jenkins runs this script and archives generated Markdown, TXT, metadata JSON, SVG, Mermaid, HTML, and ZIP files.
-""".strip()
-
-    page_sections = "\n\n".join(render_page_section(p, config, metadata) for p in pages) if pages else "No pages were detected in the SQL export."
-
-    page_doc = f"""
-## 3. Page-by-Page Documentation
-
-This section documents every detected APEX page in a single combined documentation file. Each page includes overview, architecture/communication, user guide, UI components, backend logic, security notes, and troubleshooting.
-
-{page_sections}
-""".strip()
-
-    support_components = f"""
-## 4. Shared Application Components
-
-### Lists
-{md_table(['List', 'Status'], [[x.get('name'), x.get('status')] for x in metadata.get('lists', [])])}
-
-### List of Values / LOVs
-{md_table(['LOV', 'Query/source excerpt'], [[x.get('name'), truncate_code(x.get('query', ''), 250)] for x in metadata.get('lovs', [])])}
-""".strip()
-
-    pieces = [
-        overview,
-        architecture,
-        page_doc,
-        support_components,
-        render_user_guide(metadata, config),
-        render_api_docs(metadata, config),
-        render_database_docs(metadata, config),
-        render_security_docs(metadata, config),
-    ]
-    return "\n\n".join(p.strip() for p in pieces if p and p.strip()) + "\n"
-
-
-def markdown_to_txt(markdown: str) -> str:
-    text = markdown
-    text = re.sub(r"```mermaid\n(.*?)\n```", lambda m: "[Mermaid diagram]\n" + m.group(1), text, flags=re.DOTALL)
-    text = re.sub(r"```(?:\w+)?\n(.*?)\n```", lambda m: m.group(1), text, flags=re.DOTALL)
-    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-    text = re.sub(r"`([^`]*)`", r"\1", text)
-    # Convert markdown table pipes into readable spacing enough for TXT artifacts.
-    return text.strip() + "\n"
-
-# =============================================================================
-# Write outputs
-# =============================================================================
-
-def write_outputs(metadata: Dict[str, Any], config: Dict[str, Any]) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    mermaid = build_mermaid(metadata, config)
-    ARCH_MMD_FILE.write_text(mermaid, encoding="utf-8")
-    ARCH_SVG_FILE.write_text(build_svg_diagram(metadata, config), encoding="utf-8")
-    ARCH_HTML_FILE.write_text(build_architecture_html(), encoding="utf-8")
-
-    md = render_document(metadata, config)
-    DOC_MD_FILE.write_text(md, encoding="utf-8")
-    DOC_TXT_FILE.write_text(markdown_to_txt(md), encoding="utf-8")
-    METADATA_JSON_FILE.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    with zipfile.ZipFile(DOC_ZIP_FILE, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in [DOC_MD_FILE, DOC_TXT_FILE, METADATA_JSON_FILE, ARCH_MMD_FILE, ARCH_SVG_FILE, ARCH_HTML_FILE]:
-            if path.exists():
-                zf.write(path, arcname=path.name)
-
-
-def validate_outputs() -> None:
-    required = [DOC_MD_FILE, DOC_TXT_FILE, METADATA_JSON_FILE, ARCH_MMD_FILE, ARCH_SVG_FILE, ARCH_HTML_FILE, DOC_ZIP_FILE]
-    for path in required:
-        if not path.exists() or path.stat().st_size == 0:
-            raise RuntimeError(f"Expected documentation artifact was not created: {path}")
-    md = DOC_MD_FILE.read_text(encoding="utf-8", errors="ignore")
-    required_sections = [
-        "## 1. Overview / Introduction",
-        "## 2. System Architecture",
-        "## 3. Page-by-Page Documentation",
-        "## 5. User Guide",
-        "## 6. API Documentation",
-        "## 7. Database Documentation",
-        "## 8. Security Documentation",
-    ]
-    missing = [s for s in required_sections if s not in md]
-    if missing:
-        raise RuntimeError(f"Documentation is missing required sections: {missing}")
-
-# =============================================================================
-# Main
-# =============================================================================
 
 def main() -> None:
     try:
-        print("Oracle APEX deployment documentation generator")
-        print("------------------------------------------------")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        sql = read_text(APEX_SQL_FILE)
+        config = load_config()
+        calls = find_calls(sql)
+        app_info = parse_export_header(sql)
+        pages = extract_pages(sql, calls)
+        shared = extract_shared(sql, calls)
+        database = extract_database(sql)
+        metadata = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "source_sql_file": APEX_SQL_FILE.name,
+            "source_sql_path": str(APEX_SQL_FILE),
+            "application": app_info,
+            "pages": [asdict(p) for p in pages],
+            "shared": shared,
+            "database": database,
+            "debug": {"apex_calls_detected": len(calls), "page_count": len(pages)}
+        }
+        METADATA_JSON_FILE.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        write_diagrams(metadata)
+        md = render_docs(metadata, config)
+        DOC_MD_FILE.write_text(md + "\n", encoding="utf-8")
+        DOC_TXT_FILE.write_text(markdown_to_text(md) + "\n", encoding="utf-8")
+        with zipfile.ZipFile(DOC_ZIP_FILE, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in [DOC_MD_FILE, DOC_TXT_FILE, METADATA_JSON_FILE, ARCH_SVG_FILE, ARCH_HTML_FILE, ARCH_MMD_FILE]:
+                if path.exists():
+                    zf.write(path, arcname=path.name)
+        print("Documentation generated successfully.")
         print(f"SQL file: {APEX_SQL_FILE}")
-        print(f"Config file: {DOC_CONFIG_FILE}")
-        print(f"Output dir: {OUTPUT_DIR}")
-
-        sql_text = normalize_sql(read_text_file(APEX_SQL_FILE, required=True))
-        config = load_or_create_doc_config()
-        metadata = build_metadata(sql_text, config)
-
-        print(f"Detected pages: {len(metadata.get('pages', []))}")
-        print(f"Detected tables: {len(metadata.get('database', {}).get('tables', []))}")
-        print(f"Detected APIs: {len(metadata.get('apis', []))}")
-        print(f"Detected authentication schemes: {len(metadata.get('authentication_schemes', []))}")
-        print(f"Detected authorization schemes: {len(metadata.get('authorization_schemes', []))}")
-
-        write_outputs(metadata, config)
-        validate_outputs()
-
-        print("\nDocumentation generated successfully.")
-        print(f"Markdown: {DOC_MD_FILE}")
-        print(f"Text:     {DOC_TXT_FILE}")
-        print(f"SVG:      {ARCH_SVG_FILE}")
-        print(f"Mermaid:  {ARCH_MMD_FILE}")
-        print(f"HTML:     {ARCH_HTML_FILE}")
-        print(f"Metadata: {METADATA_JSON_FILE}")
-        print(f"ZIP:      {DOC_ZIP_FILE}")
-
+        print(f"APEX calls detected: {len(calls)}")
+        print(f"Pages detected: {len(pages)}")
+        print(f"Output directory: {OUTPUT_DIR}")
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
