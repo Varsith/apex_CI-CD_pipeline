@@ -1,49 +1,54 @@
 {
   "application": {
-    "purpose": "Describe the purpose of this Oracle APEX application here.",
-    "business_problem": "Describe the business problem this application solves here.",
+    "name": "Oracle APEX Application",
+    "purpose": "Describe the purpose of this Oracle APEX application.",
+    "business_problem": "Describe the business problem solved by this application.",
     "target_users": [
-      "Business users",
-      "Administrators"
+      "End users",
+      "Application administrators"
     ],
-    "key_features": [],
-    "scope": "Generated from the APEX SQL export. Update this field with business-specific scope.",
+    "key_features": [
+      "Generated page-by-page documentation from the deployment SQL export",
+      "Architecture, API, database, security, and user guide sections in one file"
+    ],
+    "scope": "Documentation is generated from the APEX SQL file deployed by the Jenkins deployment branch.",
     "limitations": [
-      "Generated documentation depends on metadata present in the APEX SQL export."
+      "Only metadata present in the APEX SQL export can be extracted automatically.",
+      "Screenshots, exact business process descriptions, external system contracts, and infrastructure diagrams should be updated manually when needed."
     ]
   },
   "architecture": {
-    "frontend": "Oracle APEX web UI",
-    "backend": "Oracle APEX runtime, PL/SQL processes, validations, and dynamic actions",
+    "frontend": "Oracle APEX web user interface",
+    "backend": "Oracle APEX runtime, page processes, validations, dynamic actions, SQL, and PL/SQL",
     "database": "Oracle Database / APEX parsing schema",
-    "cloud_infrastructure": "Oracle Cloud Infrastructure / ORDS / APEX service as configured by the environment",
+    "cloud_infrastructure": "Oracle Cloud Infrastructure / ORDS / APEX runtime environment configured for this deployment",
     "third_party_integrations": []
   },
   "api": {
     "exposes_apis": "auto",
     "base_url": "",
-    "authentication": "Use environment-specific authentication. Update if REST APIs are exposed.",
-    "rate_limits": "Not found in SQL export. Define manually if applicable.",
+    "authentication": "Document API authentication here if REST/ORDS APIs are exposed, for example OAuth2, Basic Auth, APEX session, or API gateway token.",
+    "rate_limits": "Not defined in SQL export. Define manually if ORDS/API gateway/service-level limits are configured.",
     "error_codes": [
-      "HTTP 400",
-      "HTTP 401",
-      "HTTP 403",
-      "HTTP 404",
-      "HTTP 429",
-      "HTTP 500"
+      "400 Bad Request",
+      "401 Unauthorized",
+      "403 Forbidden",
+      "404 Not Found",
+      "429 Too Many Requests",
+      "500 Internal Server Error"
     ]
   },
   "security": {
-    "authentication_method": "Oracle APEX authentication scheme, SSO, or custom authentication as extracted/configured.",
+    "authentication_method": "Use the extracted APEX authentication scheme, SSO, custom authentication, or environment-specific login method.",
     "authorization_roles": [],
-    "encryption_details": "Use HTTPS/TLS in transit. Database encryption depends on OCI/DB configuration.",
-    "audit_logging": "Review APEX activity logs, custom audit tables, and database auditing.",
+    "encryption_details": "Use HTTPS/TLS in transit. Database encryption depends on the configured Oracle Database/OCI environment.",
+    "audit_logging": "Review APEX activity logs, custom audit tables, and database auditing configuration.",
     "best_practices": [
-      "Never commit credentials to source control.",
-      "Use Jenkins credentials binding for secrets.",
-      "Validate server-side authorization for all sensitive pages and processes.",
-      "Avoid exposing ORA-/ERR- details to end users.",
-      "Keep APEX, ORDS, and database patches current."
+      "Store secrets only in Jenkins credentials or OCI Vault, never in source control.",
+      "Apply authorization schemes to sensitive pages, buttons, processes, and APIs.",
+      "Validate input server-side and avoid leaking ORA-/ERR- details to end users.",
+      "Use least privilege for database schemas and service users.",
+      "Review audit logs for authentication, authorization, data changes, and administrative actions."
     ]
   },
   "user_guide": {
@@ -51,25 +56,20 @@
     "faq": [
       {
         "question": "How do I access the application?",
-        "answer": "Use the environment-specific APEX URL."
+        "answer": "Open the environment-specific APEX URL and sign in with an authorized account."
       },
       {
-        "question": "What should I do if login fails?",
-        "answer": "Check credentials, workspace access, and account status."
+        "question": "What should I do if I see an error?",
+        "answer": "Capture the page name, timestamp, screenshot, and steps taken, then contact the application administrator."
       }
     ],
     "troubleshooting": [
-      "Refresh the page and try again.",
-      "Confirm required fields are filled.",
-      "Contact the application administrator if APEX or ORA errors appear."
+      "Confirm that all mandatory fields are completed.",
+      "Refresh the page and retry the action once.",
+      "If the problem persists, share the page name, input values, timestamp, and screenshot with support."
     ]
   },
-  "sections": {
-    "overview": true,
-    "system_architecture": true,
-    "user_guide": true,
-    "api_documentation": true,
-    "database_documentation": true,
-    "security_documentation": true
-  }
+  "manual_api_examples": [],
+  "manual_database_notes": [],
+  "manual_security_notes": []
 }
