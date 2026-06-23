@@ -1,0 +1,72 @@
+{
+  "application": {
+    "purpose": "Oracle APEX application generated from SQL exports under the apex/ folder.",
+    "business_problem": "Replace this with the real business problem solved by the application.",
+    "target_users": [
+      "End users",
+      "Application administrators",
+      "Support users"
+    ],
+    "key_features": [],
+    "scope": "This documentation is generated during the deployment pipeline from every .sql export found under the apex/ folder.",
+    "limitations": [
+      "Only metadata present in the APEX SQL export can be extracted automatically.",
+      "Database objects deployed outside the APEX export may appear only as referenced tables or objects.",
+      "Screenshots, exact business process wording, external API contracts, and environment-specific infrastructure notes should be maintained manually when required."
+    ]
+  },
+  "architecture": {
+    "frontend": "Oracle APEX browser-based web user interface",
+    "backend": "Oracle APEX runtime, session state, page processes, validations, dynamic actions, SQL, PL/SQL, and built-in APEX APIs",
+    "database": "Oracle Database / APEX parsing schema",
+    "cloud_infrastructure": "ORDS/APEX runtime environment configured for the target deployment",
+    "third_party_integrations": []
+  },
+  "api": {
+    "authentication": "Use the extracted APEX/ORDS authentication method when present. Update manually for APIs outside the APEX export.",
+    "rate_limits": "Not defined in the APEX SQL export. Define ORDS/API Gateway/service-level limits if applicable.",
+    "error_codes": [
+      "400 Bad Request",
+      "401 Unauthorized",
+      "403 Forbidden",
+      "404 Not Found",
+      "429 Too Many Requests",
+      "500 Internal Server Error"
+    ]
+  },
+  "security": {
+    "authentication_method": "Use extracted APEX authentication schemes when present. Update manually for SSO/custom authentication.",
+    "authorization_roles": [],
+    "encryption_details": "Use HTTPS/TLS in transit. Database encryption depends on the configured Oracle Database/OCI environment.",
+    "audit_logging": "Review APEX activity logs, custom audit tables, and database auditing configuration.",
+    "best_practices": [
+      "Store secrets only in approved secret stores, never in source control.",
+      "Apply authorization schemes to sensitive pages, buttons, processes, and APIs.",
+      "Validate input server-side and avoid leaking ORA-/ERR- details to end users.",
+      "Use least privilege for database schemas and service users.",
+      "Review audit logs for authentication, authorization, data changes, and administrative actions."
+    ]
+  },
+  "user_guide": {
+    "include_screenshot_placeholders": true,
+    "faq": [
+      {
+        "question": "How do I access the application?",
+        "answer": "Open the environment-specific APEX URL and sign in with an authorized account."
+      },
+      {
+        "question": "What should I do if I see an error?",
+        "answer": "Capture the page name, timestamp, screenshot, and steps taken, then contact the application administrator."
+      }
+    ],
+    "troubleshooting": [
+      "Confirm that all required fields are completed.",
+      "Refresh the page and retry the action once.",
+      "If the problem persists, share the page name, input values, timestamp, and screenshot with support."
+    ]
+  },
+  "manual_page_descriptions": {},
+  "manual_api_examples": [],
+  "manual_database_notes": [],
+  "manual_security_notes": []
+}
